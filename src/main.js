@@ -20,6 +20,7 @@ const FLOW_KEY = "lshq.flow";
 const TICK_KEY = "lshq.lastTick";
 
 const app = document.getElementById("app");
+document.documentElement.classList.toggle("native", IN_APP);
 
 const state = {
   user: null,
@@ -305,34 +306,65 @@ function latestLogFor(userId, tz) {
 
 /* ---------- rendering ---------- */
 
+const TABS = ["team", "me", "board"];
+const TAB_NAMES = { team: "Team", me: "Me", board: "Board" };
+const RING_R = 74;
+const RING_C = 2 * Math.PI * RING_R;
+
+const ICON_PLAY = `<svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.6v12.8a1 1 0 0 0 1.53.85l10.2-6.4a1 1 0 0 0 0-1.7L9.53 4.75A1 1 0 0 0 8 5.6z"/></svg>`;
+const ICON_STOP = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6.5" y="6.5" width="11" height="11" rx="3"/></svg>`;
+
+function initials(name) {
+  const parts = String(name || "?").trim().split(/\s+/).slice(0, 2);
+  return parts.map((w) => (w[0] || "").toUpperCase()).join("") || "?";
+}
+
+function hues(seed) {
+  let h = 0;
+  for (const ch of String(seed || "x")) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return [h, (h + 55) % 360];
+}
+
+function avatar(p, { size = "", status = null } = {}) {
+  const [a, b] = hues(p?.id || p?.name);
+  const st = status !== null ? `<span class="st ${status}"></span>` : "";
+  return `<div class="av ${size}" style="--c1:hsl(${a} 80% 64%);--c2:hsl(${b} 85% 54%)">${esc(initials(p?.name))}${st}</div>`;
+}
+
+function ringOffset(seconds) {
+  return RING_C * (1 - (seconds % 3600) / 3600);
+}
+
 function renderShell() {
-  const dateLabel = new Date().toLocaleDateString("en-GB", { weekday: "short", day: "numeric", month: "short" });
+  const dateLabel = new Date().toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "short" });
   app.innerHTML = `
     <div class="top">
-      <div class="brand">Lifescale <span>HQ</span></div>
-      <div class="date">${esc(dateLabel)}</div>
+      <div class="orb"></div>
+      <div class="title"><b>Lifescale HQ</b><small>${esc(dateLabel)}</small></div>
+      <div class="me" id="meav"></div>
     </div>
-    <div class="tabs">
-      ${["team", "me", "board"]
-        .map((t) => `<button class="tab ${state.tab === t ? "on" : ""}" data-tab="${t}">${{ team: "Team", me: "Me", board: "Board" }[t]}</button>`)
-        .join("")}
+    <div class="tabs glass" id="tabs" style="--i:${TABS.indexOf(state.tab)}">
+      <span class="tab-thumb"></span>
+      ${TABS.map((t) => `<button class="tab ${state.tab === t ? "on" : ""}" data-tab="${t}">${TAB_NAMES[t]}</button>`).join("")}
     </div>
     <div id="banner"></div>
-    <div class="body" id="body"></div>
-    <div class="foot">
-      <span>${esc(state.me?.name || "")}</span>
-      <button class="link" id="signout">Sign out</button>
-    </div>`;
+    <div class="body" id="body"></div>`;
   app.querySelectorAll("[data-tab]").forEach((b) =>
     b.addEventListener("click", () => {
+      if (state.tab === b.dataset.tab) return;
       state.tab = b.dataset.tab;
+      app.querySelector("#tabs").style.setProperty("--i", TABS.indexOf(state.tab));
       app.querySelectorAll("[data-tab]").forEach((x) => x.classList.toggle("on", x === b));
-      renderBody();
+      renderBody(true);
     })
   );
-  app.querySelector("#signout").addEventListener("click", signOut);
   renderBanner();
-  renderBody();
+  renderBody(true);
+}
+
+function renderHeader() {
+  const el = document.getElementById("meav");
+  if (el) el.innerHTML = avatar(state.me, { size: "sm", status: state.flow ? "flow" : "on" });
 }
 
 function renderBanner() {
@@ -341,13 +373,22 @@ function renderBanner() {
   el.innerHTML = state.banner ? `<div class="banner ${state.banner.kind === "err" ? "err" : ""}">${esc(state.banner.text)}</div>` : "";
 }
 
-function renderBody() {
+function renderBody(animate = false) {
   const el = document.getElementById("body");
   if (!el) return;
-  if (state.tab === "team") el.innerHTML = teamView();
-  if (state.tab === "me") el.innerHTML = meView();
-  if (state.tab === "board") el.innerHTML = boardView();
+  // Don't wipe what you're typing when a live update comes in.
+  const active = document.activeElement;
+  if (!animate && active && el.contains(active) && /^(TEXTAREA|INPUT)$/.test(active.tagName)) {
+    renderHeader();
+    tick();
+    return;
+  }
+  const scroll = el.scrollTop;
+  const html = state.tab === "team" ? teamView() : state.tab === "me" ? meView() : boardView();
+  el.innerHTML = `<div class="${animate ? "fade" : ""}">${html}</div>`;
+  if (!animate) el.scrollTop = scroll;
   wireBody(el);
+  renderHeader();
   tick();
 }
 
@@ -363,32 +404,37 @@ function personCard(p) {
   const leader = standings(0)[0];
   const isLeader = leader && leader.points > 0 && leader.userId === p.id;
   const offset = isMe ? "" : tzOffsetHours(tz);
+  const status = flowStart ? "flow" : online ? "on" : "";
 
-  let status;
-  if (flowStart) status = `<div class="person-status flow" data-flow-since="${flowStart}">In flow</div>`;
-  else status = `<div class="person-status">${online ? "Online" : esc(ago(p.last_seen))}</div>`;
+  const sub = flowStart
+    ? `<div class="p-sub flow" data-flow-since="${flowStart}">In flow</div>`
+    : `<div class="p-sub">${online ? "Online now" : esc(ago(p.last_seen))}</div>`;
 
   return `
-    <div class="card">
-      <div class="person-head">
-        <span class="dot ${flowStart ? "flow" : online ? "online" : ""}"></span>
-        <span class="person-name">${esc(p.name)}${isMe ? ` <span style="color:var(--faint);font-weight:500;font-size:12px">(you)</span>` : ""}</span>
-        ${isLeader ? `<span class="crown" title="Leading this month">♛</span>` : ""}
-        ${status}
+    <div class="card glass person">
+      <div class="p-head">
+        ${avatar(p, { size: "lg", status })}
+        <div style="min-width:0;flex:1">
+          <div class="p-name">${esc(p.name)}${isLeader ? `<span class="crown" title="Leading this month">♛</span>` : ""}${isMe ? ` <span class="hint">· you</span>` : ""}</div>
+          ${sub}
+        </div>
       </div>
-      ${focus ? `<div class="focus"><span class="label">Today</span>${esc(focus)}</div>` : `<div class="focus" style="color:var(--faint)">No check-in yet today</div>`}
-      ${np ? `<div class="music">♫ <b>${esc(np.track)}</b> · ${esc(np.artist)}</div>` : ""}
-      <div class="meta">
-        <span>${esc(timeIn(tz))} local${offset ? ` (${offset})` : ""}</span>
-        <span>Flow today ${hm(flowTodayFor(p.id, tz))}</span>
-        <span>Wins ${log?.wins || 0}</span>
+      ${focus
+        ? `<div><div class="label">Working on</div><div class="p-focus">${esc(focus)}</div></div>`
+        : `<div class="p-focus empty">Hasn't checked in today</div>`}
+      ${np ? `<div class="music"><span class="eq"><i></i><i></i><i></i></span><span class="txt"><b>${esc(np.track)}</b> · ${esc(np.artist)}</span></div>` : ""}
+      <div class="chips">
+        <span class="chip"><b>${esc(timeIn(tz))}</b> ${offset ? esc(offset) : "local"}</span>
+        <span class="chip">Flow <b>${hm(flowTodayFor(p.id, tz))}</b></span>
+        <span class="chip">Wins <b>${log?.wins || 0}</b></span>
       </div>
-      ${log?.notes ? `<div class="row"><span>Done:</span><b>${esc(log.notes)}</b></div>` : ""}
+      ${log?.notes ? `<div class="done"><div class="label">Done today</div><b>${esc(log.notes)}</b></div>` : ""}
     </div>`;
 }
 
 function teamView() {
   if (!state.profiles.length) return `<div class="empty">No one here yet.</div>`;
+  // Partner first, you second.
   const ordered = [...state.profiles].sort((a, b) => (a.id === state.user.id) - (b.id === state.user.id));
   return ordered.map(personCard).join("");
 }
@@ -396,40 +442,57 @@ function teamView() {
 function meView() {
   const running = !!state.flow;
   const t = state.today || {};
+  const el = flowElapsed();
   const todayFlow = flowTodayFor(state.user.id, MY_TZ);
   return `
-    <div class="card timer">
-      <div class="clock ${running ? "live" : ""}" id="myclock">${running ? clock(flowElapsed()) : "00:00"}</div>
-      <div class="sub">${running ? `Working on: ${esc(state.flow.task || "no focus set")}` : `Flow today: ${hm(todayFlow)}`}</div>
-      <button class="btn ${running ? "stop" : ""}" id="flowbtn">${running ? "End flow" : "Start flow"}</button>
-      <div class="hint">Stops itself after ${IDLE_CUTOFF_MINUTES} min with no keyboard or mouse.</div>
+    <div class="card glass timer">
+      <div class="ring">
+        <svg viewBox="0 0 168 168">
+          <defs>
+            <linearGradient id="ringgrad" x1="0" y1="0" x2="1" y2="1">
+              <stop offset="0" stop-color="#ffb547"/>
+              <stop offset="1" stop-color="#ff7ab6"/>
+            </linearGradient>
+          </defs>
+          <circle class="track" cx="84" cy="84" r="${RING_R}" fill="none" stroke-width="9"/>
+          <circle class="prog" id="ringprog" cx="84" cy="84" r="${RING_R}" fill="none" stroke="url(#ringgrad)" stroke-width="9"
+            stroke-linecap="round" stroke-dasharray="${RING_C}" stroke-dashoffset="${running ? ringOffset(el) : RING_C}"
+            style="opacity:${running ? 1 : 0}"/>
+        </svg>
+        <div class="center">
+          <div class="clock" id="myclock">${running ? clock(el) : "00:00"}</div>
+          <div class="clock-sub" id="clocksub">${running ? "in flow" : `${hm(todayFlow)} today`}</div>
+        </div>
+      </div>
+      ${running && state.flow.task ? `<div class="working">${esc(state.flow.task)}</div>` : ""}
+      <button class="play ${running ? "stop" : ""}" id="flowbtn" title="${running ? "End flow" : "Start flow"}">${running ? ICON_STOP : ICON_PLAY}</button>
+      <div class="hint">Auto-stops after ${IDLE_CUTOFF_MINUTES} min idle</div>
     </div>
 
-    <div class="card">
-      <h3>Today's focus</h3>
+    <div class="card glass">
+      <div class="label">Today's focus</div>
       <textarea id="focus" rows="2" placeholder="What are you working on today?">${esc(t.focus || "")}</textarea>
-      <div style="margin-top:8px;display:flex;align-items:center"><button class="btn ghost" id="savefocus" style="width:auto">Update</button><span class="saved" id="focussaved"></span></div>
+      <div class="row-end"><span class="saved" id="focussaved">Saved</span><button class="pill" id="savefocus">Update</button></div>
     </div>
 
-    <div class="card">
-      <div class="wins">
-        <div>
-          <h3 style="margin:0">Wins today</h3>
-          <div class="hint" style="margin:2px 0 0">Signed client, booked call, shipped something.</div>
-        </div>
-        <div class="stepper">
-          <button id="winminus">−</button>
-          <span class="n">${t.wins || 0}</span>
-          <button id="winplus">+</button>
-        </div>
+    <div class="card glass wins">
+      <div>
+        <div class="label" style="margin-bottom:2px">Wins today</div>
+        <div class="hint">Signed, booked, shipped.</div>
+      </div>
+      <div class="stepper">
+        <button id="winminus" aria-label="Remove a win">−</button>
+        <span class="n">${t.wins || 0}</span>
+        <button id="winplus" aria-label="Add a win">+</button>
       </div>
     </div>
 
-    <div class="card">
-      <h3>What did you get done?</h3>
-      <textarea id="notes" rows="4" placeholder="Note down what you did today.">${esc(t.notes || "")}</textarea>
-      <div style="margin-top:8px;display:flex;align-items:center"><button class="btn ghost" id="savenotes" style="width:auto">Save</button><span class="saved" id="notessaved"></span></div>
-    </div>`;
+    <div class="card glass">
+      <div class="label">What did you get done?</div>
+      <textarea id="notes" rows="3" placeholder="Note down what you did today.">${esc(t.notes || "")}</textarea>
+      <div class="row-end"><span class="saved" id="notessaved">Saved</span><button class="pill" id="savenotes">Save</button></div>
+    </div>
+    <div class="foot"><button class="link" id="signout">Sign out</button></div>`;
 }
 
 function boardView() {
@@ -438,44 +501,66 @@ function boardView() {
   const winner = lastMonthWinner();
   const lead = now[0];
   const tie = now[1] && lead && now[1].points === lead.points;
+  const max = Math.max(1, ...now.map((r) => r.points));
 
-  const eom = winner
-    ? winner.tie
-      ? `<div class="card eom"><div class="small">${esc(monthRange(-1).label)}</div><div class="big">Tie: ${esc(winner.names.join(" & "))}</div></div>`
-      : `<div class="card eom"><div class="small">Employee of the month · ${esc(monthRange(-1).label)}</div><div class="big">♛ ${esc(winner.name)}</div><div class="small">${winner.points} pts</div></div>`
-    : "";
+  let hero;
+  if (winner && !winner.tie) {
+    hero = `
+      <div class="card glass hero">
+        <div class="crown-big">♛</div>
+        ${avatar({ id: winner.userId, name: winner.name }, { size: "lg" })}
+        <div class="big">${esc(winner.name)}</div>
+        <div class="small">Employee of the month · ${esc(monthRange(-1).label)} · ${winner.points} pts</div>
+      </div>`;
+  } else if (winner && winner.tie) {
+    hero = `<div class="card glass hero"><div class="crown-big">♛</div><div class="big">Tie</div><div class="small">${esc(winner.names.join(" & "))} · ${esc(monthRange(-1).label)}</div></div>`;
+  } else if (lead && lead.points > 0 && !tie) {
+    hero = `
+      <div class="card glass hero">
+        ${avatar({ id: lead.userId, name: lead.name }, { size: "lg" })}
+        <div class="big">${esc(lead.name)} leads</div>
+        <div class="small">Crowned on the 1st · ${esc(range.label)}</div>
+      </div>`;
+  } else {
+    hero = `<div class="card glass hero"><div class="crown-big">♛</div><div class="big">Up for grabs</div><div class="small">Start a flow to get on the board</div></div>`;
+  }
 
   const rows = now
     .map(
       (r, i) => `
       <div class="rank ${i === 0 && r.points > 0 && !tie ? "lead" : ""}">
-        <span class="pos">${i + 1}</span>
-        <span class="who">${esc(r.name)}<br><span class="breakdown">${hm(r.flowSec)} flow · ${r.wins} wins · ${r.fullDays} full days</span></span>
+        ${avatar({ id: r.userId, name: r.name }, { size: "sm" })}
+        <div class="who">
+          <b>${esc(r.name)}</b>
+          <small>${hm(r.flowSec)} flow · ${r.wins} ${r.wins === 1 ? "win" : "wins"} · ${r.fullDays} full ${r.fullDays === 1 ? "day" : "days"}</small>
+          <div class="bar"><i style="width:${Math.round((r.points / max) * 100)}%"></i></div>
+        </div>
         <span class="pts">${r.points}</span>
       </div>`
     )
     .join("");
 
   return `
-    ${eom}
-    <div class="card">
-      <h3>${esc(range.label)}</h3>
+    ${hero}
+    <div class="card glass">
+      <div class="label">${esc(range.label)}</div>
       ${rows || `<div class="empty">Nothing logged yet.</div>`}
     </div>
-    <div class="card">
-      <h3>How points work</h3>
-      <div class="hint" style="margin:0">${POINTS_PER_FLOW_MINUTE} per flow minute · ${POINTS_PER_WIN} per win · ${POINTS_PER_FULL_DAY} per full day (checked in and wrote what you did). Winner is crowned on the 1st.</div>
+    <div class="card glass">
+      <div class="label">Points</div>
+      <div class="hint">${POINTS_PER_FLOW_MINUTE} per flow minute · ${POINTS_PER_WIN} per win · ${POINTS_PER_FULL_DAY} per full day (checked in and wrote what you did)</div>
     </div>`;
 }
 
-function flash(id, text = "Saved") {
+function flash(id) {
   const el = document.getElementById(id);
   if (!el) return;
-  el.textContent = text;
-  setTimeout(() => (el.textContent = ""), 2000);
+  el.classList.add("show");
+  setTimeout(() => el.classList.remove("show"), 1800);
 }
 
 function wireBody(el) {
+  el.querySelector("#signout")?.addEventListener("click", signOut);
   el.querySelector("#flowbtn")?.addEventListener("click", () => (state.flow ? stopFlow() : startFlow()));
   el.querySelector("#savefocus")?.addEventListener("click", async () => {
     const v = el.querySelector("#focus").value.trim();
@@ -496,8 +581,15 @@ function wireBody(el) {
 }
 
 function tick() {
-  const mine = document.getElementById("myclock");
-  if (mine && state.flow) mine.textContent = clock(flowElapsed());
+  if (state.flow) {
+    const s = flowElapsed();
+    const mine = document.getElementById("myclock");
+    if (mine) mine.textContent = clock(s);
+    const ring = document.getElementById("ringprog");
+    if (ring) ring.setAttribute("stroke-dashoffset", ringOffset(s));
+    const sub = document.getElementById("clocksub");
+    if (sub) sub.textContent = s >= 3600 ? `in flow · hour ${Math.floor(s / 3600) + 1}` : "in flow";
+  }
   document.querySelectorAll("[data-flow-since]").forEach((n) => {
     const since = Number(n.dataset.flowSince);
     n.textContent = `In flow · ${clock((Date.now() - since) / 1000)}`;
@@ -510,13 +602,14 @@ function renderAuth(mode = "in", msg = "") {
   stopLoops();
   app.innerHTML = `
     <div class="center">
+      <div class="orb big"></div>
       <h1>Lifescale HQ</h1>
       <p>${mode === "in" ? "Sign in to see who's online." : "Create your account."}</p>
-      ${msg ? `<div class="banner ${msg.startsWith("!") ? "err" : ""}" style="margin:0 0 12px">${esc(msg.replace(/^!/, ""))}</div>` : ""}
+      ${msg ? `<div class="banner ${msg.startsWith("!") ? "err" : ""}">${esc(msg.replace(/^!/, ""))}</div>` : ""}
       ${mode === "up" ? `<div class="field"><input id="name" placeholder="Your name" autocomplete="off"></div>` : ""}
       <div class="field"><input id="email" type="email" placeholder="Email" autocomplete="off"></div>
       <div class="field"><input id="password" type="password" placeholder="Password (6+ characters)"></div>
-      <button class="btn" id="go">${mode === "in" ? "Sign in" : "Create account"}</button>
+      <button class="pill primary" id="go">${mode === "in" ? "Sign in" : "Create account"}</button>
       <div class="switch"><button class="link" id="switch">${mode === "in" ? "New here? Create an account" : "Have an account? Sign in"}</button></div>
     </div>`;
   app.querySelector("#switch").addEventListener("click", () => renderAuth(mode === "in" ? "up" : "in"));
@@ -546,10 +639,11 @@ function renderCheckin() {
   const greet = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
   app.innerHTML = `
     <div class="center">
+      <div class="orb big"></div>
       <h1>${greet}${first ? `, ${esc(first)}` : ""}.</h1>
       <p>What are you working on today?</p>
-      <div class="field"><textarea id="focus" rows="3" placeholder="e.g. 40 DMs to 3D viz studios, finish Mark's ad set"></textarea></div>
-      <button class="btn" id="go">Lock it in</button>
+      <div class="field"><textarea id="focus" rows="3" placeholder="30 DMs to architects working with developers…"></textarea></div>
+      <button class="pill primary" id="go">Lock it in</button>
       <div class="switch"><button class="link" id="skip">Skip for now</button></div>
     </div>`;
   const ta = app.querySelector("#focus");

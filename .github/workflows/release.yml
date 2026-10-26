@@ -2,8 +2,13 @@ name: Build Mac app
 
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
+    paths-ignore: ["README.md", "supabase/**"]
   workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: true
 
 permissions:
   contents: write

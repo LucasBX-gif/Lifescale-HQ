@@ -38,13 +38,7 @@ Optional: System Settings → General → **Login Items** → add Lifescale HQ s
 
 ## Shipping a new version
 
-Bump `version` in `src-tauri/tauri.conf.json` and `package.json`, then push a tag:
-
-```
-git tag v0.1.1 && git push origin v0.1.1
-```
-
-GitHub builds the Mac app (Apple Silicon + Intel) and puts it on the Releases page. You can also run the **Build Mac app** workflow by hand from the Actions tab.
+Every push to `main` makes GitHub build the Mac app (Apple Silicon + Intel) and put it on the Releases page under the version in `src-tauri/tauri.conf.json`. Bump that version (and `package.json`) when you want a new release instead of replacing the current one. You can also run the **Build Mac app** workflow by hand from the Actions tab.
 
 ## Developing locally
 

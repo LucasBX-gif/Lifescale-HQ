@@ -36,6 +36,12 @@ The flow timer stops itself after 10 minutes with no keyboard or mouse input, an
 
 Optional: System Settings → General → **Login Items** → add Lifescale HQ so it starts with your Mac.
 
+## Updates
+
+The app checks for a new version on launch and every 3 hours, downloads it in the background, and shows a green **Update** button under the orb. Click it and it restarts on the new version. No re-downloading.
+
+This needs the `TAURI_SIGNING_PRIVATE_KEY` secret set in the repo (Settings → Secrets and variables → Actions) and the repo to be public so the app can reach the release files.
+
 ## Shipping a new version
 
 Every push to `main` makes GitHub build the Mac app (Apple Silicon + Intel) and put it on the Releases page under the version in `src-tauri/tauri.conf.json`. Bump that version (and `package.json`) when you want a new release instead of replacing the current one. You can also run the **Build Mac app** workflow by hand from the Actions tab.

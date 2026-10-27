@@ -103,6 +103,44 @@ mod mac {
         })
     }
 
+    tauri_panel! {
+        panel!(FxPanel {
+            config: {
+                can_become_key_window: false,
+                is_floating_panel: true
+            }
+        })
+    }
+
+    /// The celebration overlay: above everything (even the bar), on every desktop, never takes focus.
+    pub fn make_fx_panel(app: &AppHandle) {
+        let Some(window) = app.get_webview_window("fx") else { return };
+        let _ = window.set_ignore_cursor_events(true);
+        let Ok(panel) = window.to_panel::<FxPanel>() else { return };
+        panel.set_level(PanelLevel::PopUpMenu.value());
+        let _ = panel.add_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .ignores_cycle()
+                .into(),
+        );
+    }
+
+    pub fn show_fx(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("fx") {
+            p.show();
+        }
+    }
+
+    pub fn hide_fx(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("fx") {
+            p.hide();
+        }
+    }
+
     pub fn make_panel(app: &AppHandle) {
         let Some(window) = app.get_webview_window("main") else { return };
         let Ok(panel) = window.to_panel::<BarPanel>() else { return };
@@ -140,6 +178,37 @@ static LAST_AUTO_HIDE_MS: AtomicU64 = AtomicU64::new(0);
 
 fn now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+/// Cover the whole screen the bar is on with the celebration overlay and play it.
+#[tauri::command]
+fn celebrate(app: tauri::AppHandle, payload: serde_json::Value) {
+    let Some(fx) = app.get_webview_window("fx") else { return };
+    let monitor = app
+        .get_webview_window("main")
+        .and_then(|w| w.current_monitor().ok().flatten())
+        .or_else(|| fx.primary_monitor().ok().flatten());
+    if let Some(m) = monitor {
+        let _ = fx.set_position(*m.position());
+        let _ = fx.set_size(*m.size());
+    }
+    let _ = fx.set_ignore_cursor_events(true);
+    #[cfg(target_os = "macos")]
+    mac::show_fx(&app);
+    #[cfg(not(target_os = "macos"))]
+    let _ = fx.show();
+    let _ = app.emit_to("fx", "celebrate", payload);
+}
+
+/// The overlay finished playing.
+#[tauri::command]
+fn fx_done(app: tauri::AppHandle) {
+    #[cfg(target_os = "macos")]
+    mac::hide_fx(&app);
+    #[cfg(not(target_os = "macos"))]
+    if let Some(fx) = app.get_webview_window("fx") {
+        let _ = fx.hide();
+    }
 }
 
 /// Centre the bar at the top of whichever screen it's on, just under the menu bar.
@@ -200,7 +269,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![now_playing, idle_seconds])
+        .invoke_handler(tauri::generate_handler![now_playing, idle_seconds, celebrate, fx_done])
         .setup(|app| {
             // Menu bar only: no Dock icon.
             #[cfg(target_os = "macos")]
@@ -219,7 +288,14 @@ pub fn run() {
             }
 
             #[cfg(target_os = "macos")]
-            mac::make_panel(app.handle());
+            {
+                mac::make_panel(app.handle());
+                mac::make_fx_panel(app.handle());
+            }
+            #[cfg(not(target_os = "macos"))]
+            if let Some(fx) = app.get_webview_window("fx") {
+                let _ = fx.set_ignore_cursor_events(true);
+            }
 
             let open = MenuItem::with_id(app, "open", "Open Lifescale HQ", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -262,6 +338,9 @@ pub fn run() {
         })
         .on_window_event(|window, event| {
             // Click anywhere else and the bar tucks itself away.
+            if window.label() != "main" {
+                return;
+            }
             if let WindowEvent::Focused(false) = event {
                 if window.is_visible().unwrap_or(false) {
                     LAST_AUTO_HIDE_MS.store(now_ms(), Ordering::Relaxed);

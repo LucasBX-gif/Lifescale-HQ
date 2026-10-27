@@ -10,7 +10,10 @@ import {
   POINTS_PER_WIN,
   POINTS_PER_FULL_DAY,
   IDLE_CUTOFF_MINUTES,
+  CHEER_MIN_FLOW_MINUTES,
+  CHEER_MIN_PARTNER_FLOW_MINUTES,
 } from "./config.js";
+import { myFlowCheer, myWinCheer, myDayCheer, partnerFlowCheer, partnerWinCheer, crownCheer } from "./cheers.js";
 
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
@@ -18,6 +21,13 @@ const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 
 const IN_APP = typeof window !== "undefined" && "__TAURI_INTERNALS__" in window;
 const native = (cmd) => (IN_APP ? invoke(cmd).catch(() => null) : Promise.resolve(null));
+
+/** Full-screen fireworks + message (see src/fx.js). */
+function celebrate(payload) {
+  if (!payload) return;
+  if (IN_APP) invoke("celebrate", { payload }).catch((e) => console.warn("celebrate failed", e));
+  else console.log("celebrate", payload);
+}
 const MY_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
 const FLOW_KEY = "lshq.flow";
 const TICK_KEY = "lshq.lastTick";
@@ -208,13 +218,27 @@ function joinPresence() {
     state.presence = out;
     if (state.tab === "now") renderBody();
   });
-  ch.on("postgres_changes", { event: "*", schema: "public", table: "daily_logs" }, async () => {
+  ch.on("postgres_changes", { event: "*", schema: "public", table: "daily_logs" }, async (change) => {
+    const row = change.new;
+    const prevWins = row ? state.logs.find((l) => l.user_id === row.user_id && l.log_date === row.log_date)?.wins || 0 : 0;
     await loadActivity();
     renderBody();
+    if (row && row.user_id !== state.user.id && (row.wins || 0) > prevWins) {
+      const who = state.profiles.find((p) => p.id === row.user_id);
+      celebrate(partnerWinCheer({ name: who?.name, winsToday: row.wins, after: standings(0), myId: state.user.id }));
+    }
   });
-  ch.on("postgres_changes", { event: "*", schema: "public", table: "flow_sessions" }, async () => {
+  ch.on("postgres_changes", { event: "INSERT", schema: "public", table: "flow_sessions" }, async (change) => {
+    const row = change.new;
     await loadActivity();
     renderBody();
+    if (row && row.user_id !== state.user.id && row.seconds >= CHEER_MIN_PARTNER_FLOW_MINUTES * 60) {
+      const who = state.profiles.find((p) => p.id === row.user_id);
+      const tz = state.presence[row.user_id]?.tz || who?.timezone || "UTC";
+      celebrate(
+        partnerFlowCheer({ name: who?.name, seconds: row.seconds, endMs: Date.parse(row.ended_at), tz, after: standings(0), myId: state.user.id })
+      );
+    }
   });
   ch.subscribe((status) => {
     if (status === "SUBSCRIBED") track();
@@ -235,7 +259,7 @@ function startFlow() {
   renderBody();
 }
 
-async function stopFlow(endAt = Date.now(), reason = null) {
+async function stopFlow(endAt = Date.now(), reason = null, { idle = false, quiet = false } = {}) {
   if (!state.flow) return;
   const flow = state.flow;
   state.flow = null;
@@ -247,6 +271,11 @@ async function stopFlow(endAt = Date.now(), reason = null) {
     renderBody();
     return;
   }
+  const before = standings(0);
+  const monthStart = monthRange(0).start.getTime();
+  const longestBeforeSec = state.sessions
+    .filter((x) => x.user_id === state.user.id && new Date(x.started_at).getTime() >= monthStart)
+    .reduce((m, x) => Math.max(m, x.seconds), 0);
   const { error } = await sb.from("flow_sessions").insert({
     user_id: state.user.id,
     task: flow.task,
@@ -258,6 +287,22 @@ async function stopFlow(endAt = Date.now(), reason = null) {
   else setBanner(reason ? `${reason} Logged ${hm(seconds)}.` : `Logged ${hm(seconds)} of flow.`);
   await loadActivity();
   renderBody();
+  if (!error && !quiet && seconds >= CHEER_MIN_FLOW_MINUTES * 60) {
+    celebrate(
+      myFlowCheer({
+        seconds,
+        startMs: flow.startedAt,
+        endMs: endAt,
+        tz: MY_TZ,
+        before,
+        after: standings(0),
+        userId: state.user.id,
+        flowTodaySec: flowTodayFor(state.user.id, MY_TZ),
+        longestBeforeSec,
+        idle,
+      })
+    );
+  }
 }
 
 /* ---------- scoring ---------- */
@@ -604,10 +649,22 @@ function wireBody(el) {
   el.querySelector("#savelog")?.addEventListener("click", async () => {
     const focus = el.querySelector("#focus").value.trim();
     const notes = el.querySelector("#notes").value.trim();
-    if (await saveToday({ focus: focus || null, notes: notes || null })) flash("logsaved");
+    const wasFull = !!(state.today?.focus && state.today?.notes);
+    const before = standings(0);
+    if (await saveToday({ focus: focus || null, notes: notes || null })) {
+      flash("logsaved");
+      if (!wasFull && focus && notes) {
+        celebrate(myDayCheer({ points: POINTS_PER_FULL_DAY, before, after: standings(0), userId: state.user.id }));
+      }
+    }
   });
   el.querySelector("#winplus")?.addEventListener("click", async () => {
-    if (await saveToday({ wins: (state.today?.wins || 0) + 1 })) renderBody();
+    const before = standings(0);
+    const wins = (state.today?.wins || 0) + 1;
+    if (await saveToday({ wins })) {
+      renderBody();
+      celebrate(myWinCheer({ winsToday: wins, before, after: standings(0), userId: state.user.id, points: POINTS_PER_WIN }));
+    }
   });
   el.querySelector("#winminus")?.addEventListener("click", async () => {
     const w = state.today?.wins || 0;
@@ -748,7 +805,7 @@ async function pollIdle() {
   if (!state.flow) return;
   const idle = await native("idle_seconds");
   if (idle != null && idle >= IDLE_CUTOFF_MINUTES * 60) {
-    await stopFlow(Date.now() - idle * 1000, `Timer stopped: no activity for ${IDLE_CUTOFF_MINUTES} min.`);
+    await stopFlow(Date.now() - idle * 1000, `Timer stopped: no activity for ${IDLE_CUTOFF_MINUTES} min.`, { idle: true });
   }
 }
 
@@ -815,6 +872,7 @@ async function doEnter(user) {
     app.querySelector("#out").addEventListener("click", signOut);
     return;
   }
+  maybeCrown();
   // Pick up the cutoff check straight away if the app was closed mid-session.
   secondTick();
   joinPresence();
@@ -824,8 +882,23 @@ async function doEnter(user) {
   else renderCheckin();
 }
 
+/** First open of a new month: crown last month's Employee of the Month, once. */
+function maybeCrown() {
+  const winner = lastMonthWinner();
+  if (!winner || winner.tie) return;
+  const label = monthRange(-1).label;
+  const key = "lshq.crowned";
+  try {
+    if (localStorage.getItem(key) === label) return;
+    localStorage.setItem(key, label);
+  } catch {
+    return;
+  }
+  setTimeout(() => celebrate(crownCheer({ winner, monthLabel: label, isMe: winner.userId === state.user.id })), 1500);
+}
+
 async function signOut() {
-  if (state.flow) await stopFlow();
+  if (state.flow) await stopFlow(Date.now(), null, { quiet: true });
   stopLoops();
   state.user = null;
   await sb.auth.signOut();

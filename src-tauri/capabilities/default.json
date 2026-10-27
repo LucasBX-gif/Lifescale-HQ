@@ -3,7 +3,8 @@
   "identifier": "default",
   "description": "Permissions for the main panel",
   "windows": [
-    "main"
+    "main",
+    "fx"
   ],
   "permissions": [
     "core:default",

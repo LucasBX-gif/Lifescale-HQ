@@ -101,9 +101,7 @@ mod mac {
                 is_floating_panel: true
             }
         })
-    }
 
-    tauri_panel! {
         panel!(FxPanel {
             config: {
                 can_become_key_window: false,

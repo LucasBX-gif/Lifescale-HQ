@@ -86,6 +86,13 @@ function hm(seconds) {
   return `${Math.floor(m / 60)}h ${String(m % 60).padStart(2, "0")}m`;
 }
 
+function agoShort(ms) {
+  const mins = Math.max(1, Math.round((Date.now() - ms) / 60000));
+  if (mins < 60) return `${mins}m ago`;
+  const h = Math.round(mins / 60);
+  return h < 24 ? `${h}h ago` : `${Math.round(h / 24)}d ago`;
+}
+
 function ago(iso) {
   if (!iso) return "Offline";
   const mins = Math.round((Date.now() - new Date(iso).getTime()) / 60000);
@@ -239,7 +246,24 @@ function presencePayload() {
     flow_task: state.flow?.task || null,
     np: state.nowPlaying,
     tz: MY_TZ,
+    // When you last touched the keyboard or mouse, and a heartbeat so stale entries can be spotted.
+    active_at: Date.now() - (state.idleSec || 0) * 1000,
+    hb: Date.now(),
   };
+}
+
+const AWAY_AFTER_MS = 5 * 60 * 1000;
+const STALE_AFTER_MS = 3 * 60 * 1000;
+
+/** online = touched the Mac in the last 5 min; away = app open but idle; offline = gone or stale. */
+function presenceStatus(p) {
+  const pres = state.presence[p.id];
+  const now = Date.now();
+  // Old app versions don't send a heartbeat; treat them as plain online.
+  if (pres && pres.hb && now - pres.hb > STALE_AFTER_MS) return { kind: "offline", lastMs: pres.active_at || Date.parse(p.last_seen) || 0 };
+  if (!pres) return { kind: "offline", lastMs: Date.parse(p.last_seen) || 0 };
+  if (pres.active_at && now - pres.active_at > AWAY_AFTER_MS) return { kind: "away", lastMs: pres.active_at };
+  return { kind: "online", lastMs: now };
 }
 
 function track() {
@@ -509,9 +533,10 @@ function renderBody(animate = false) {
 }
 
 function personTile(p) {
-  const pres = state.presence[p.id];
-  const online = !!pres;
-  const tz = pres?.tz || p.timezone || "UTC";
+  const ps = presenceStatus(p);
+  const pres = ps.kind === "offline" ? null : state.presence[p.id];
+  const online = ps.kind === "online";
+  const tz = state.presence[p.id]?.tz || p.timezone || "UTC";
   const flowStart = pres?.flow_started_at;
   const log = latestLogFor(p.id, tz);
   const focus = pres?.focus || log?.focus;
@@ -519,11 +544,11 @@ function personTile(p) {
   const leader = standings(0)[0];
   const isLeader = leader && leader.points > 0 && leader.userId === p.id;
   const offset = tzOffsetHours(tz);
-  const status = flowStart ? "flow" : online ? "on" : "";
+  const status = flowStart ? "flow" : online ? "on" : ps.kind === "away" ? "away" : "";
 
   const sub = flowStart
     ? `<div class="p-sub flow" data-flow-since="${flowStart}">In flow</div>`
-    : `<div class="p-sub">${online ? "Online now" : esc(ago(p.last_seen))}</div>`;
+    : `<div class="p-sub">${online ? "Online now" : ps.kind === "away" ? `Away · active ${esc(agoShort(ps.lastMs))}` : ps.lastMs ? esc(ago(new Date(ps.lastMs).toISOString())) : "Offline"}</div>`;
 
   return `
     <div class="tile glass grow">
@@ -1138,8 +1163,15 @@ async function pollMusic() {
 }
 
 async function pollIdle() {
-  if (!state.flow) return;
   const idle = await native("idle_seconds");
+  if (idle != null) {
+    const wasAway = (state.idleSec || 0) * 1000 > AWAY_AFTER_MS;
+    state.idleSec = idle;
+    const isAway = idle * 1000 > AWAY_AFTER_MS;
+    // Tell the other person straight away when you go away or come back.
+    if (wasAway !== isAway) track();
+  }
+  if (!state.flow) return;
   if (idle != null && idle >= IDLE_CUTOFF_MINUTES * 60) {
     await stopFlow(Date.now() - idle * 1000, `Timer stopped: no activity for ${IDLE_CUTOFF_MINUTES} min.`, { idle: true });
   }
@@ -1169,7 +1201,8 @@ function secondTick() {
 }
 
 async function heartbeat() {
-  await sb.from("profiles").update({ last_seen: new Date().toISOString(), timezone: MY_TZ }).eq("id", state.user.id);
+  const lastActive = new Date(Date.now() - (state.idleSec || 0) * 1000).toISOString();
+  await sb.from("profiles").update({ last_seen: lastActive, timezone: MY_TZ }).eq("id", state.user.id);
 }
 
 function startLoops() {
@@ -1177,6 +1210,11 @@ function startLoops() {
   state.timers.push(setInterval(pollMusic, 10000));
   state.timers.push(setInterval(pollIdle, 30000));
   state.timers.push(setInterval(heartbeat, 120000));
+  // Presence heartbeat, and re-render so "away" and stale people update even without new events.
+  state.timers.push(setInterval(() => {
+    track();
+    if (state.tab === "now") renderBody();
+  }, 60000));
   state.timers.push(setInterval(async () => {
     await Promise.all([loadProfiles(), loadActivity()]);
     renderBody();

@@ -1,6 +1,6 @@
 [package]
 name = "lifescale-hq"
-version = "0.5.0"
+version = "0.5.1"
 description = "Lifescale HQ menu bar app"
 edition = "2021"
 

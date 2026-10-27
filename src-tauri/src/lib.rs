@@ -1,22 +1,13 @@
 use serde::Serialize;
 use std::process::Command;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
-    menu::{Menu, MenuItem},
+    menu::{Menu, MenuItem, PredefinedMenuItem},
     tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
-    Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow, WindowEvent,
+    AppHandle, Emitter, LogicalPosition, LogicalSize, Manager, WebviewWindow, WindowEvent,
 };
-
-/// The bar is wide and short and sits just under the menu bar.
-const BAR_MAX_WIDTH: f64 = 920.0;
-const BAR_HEIGHT: u32 = 156;
-const BAR_MAX_TALL: u32 = 560;
-
-/// The bar grows taller for the calendar, then shrinks back.
-static BAR_H: AtomicU32 = AtomicU32::new(BAR_HEIGHT);
-const BELOW_MENU_BAR: f64 = 42.0;
 
 #[derive(Serialize)]
 struct NowPlaying {
@@ -91,6 +82,91 @@ async fn idle_seconds() -> Option<u64> {
     None
 }
 
+
+/* ---------- layout state ---------- */
+
+/// The bar is wide and short and sits just under the menu bar (or next to the mini widget).
+const BAR_MAX_WIDTH: f64 = 920.0;
+const BAR_HEIGHT: u32 = 156;
+const BAR_MAX_TALL: u32 = 560;
+const BELOW_MENU_BAR: f64 = 42.0;
+const MINI_W: f64 = 440.0;
+const MINI_H: f64 = 64.0;
+const EDGE: f64 = 12.0;
+
+/// The bar grows taller for the calendar, then shrinks back.
+static BAR_H: AtomicU32 = AtomicU32::new(BAR_HEIGHT);
+/// Mini widget pinned on screen.
+static PINNED: AtomicBool = AtomicBool::new(false);
+/// Full bar currently open.
+static EXPANDED: AtomicBool = AtomicBool::new(false);
+/// Where the mini widget sits (logical px), stored as f64 bits. NaN = not set yet.
+static MINI_X: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+static MINI_Y: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+/// When the bar last closed by itself, so the same click on the menu bar icon doesn't reopen it.
+static LAST_AUTO_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
+
+fn mini_pos() -> Option<(f64, f64)> {
+    let x = f64::from_bits(MINI_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(MINI_Y.load(Ordering::Relaxed));
+    if x.is_nan() || y.is_nan() {
+        None
+    } else {
+        Some((x, y))
+    }
+}
+
+fn set_mini_pos(x: f64, y: f64) {
+    MINI_X.store(x.to_bits(), Ordering::Relaxed);
+    MINI_Y.store(y.to_bits(), Ordering::Relaxed);
+}
+
+/// Logical (x, y, width, height) of the screen the window is on.
+fn screen_of(window: &WebviewWindow) -> Option<(f64, f64, f64, f64)> {
+    let m = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .or_else(|| window.primary_monitor().ok().flatten())?;
+    let s = m.scale_factor();
+    let size = m.size().to_logical::<f64>(s);
+    let pos = m.position().to_logical::<f64>(s);
+    Some((pos.x, pos.y, size.width, size.height))
+}
+
+/// Full bar: under the menu bar, or anchored to the mini widget when it's pinned.
+fn place_bar(window: &WebviewWindow) {
+    let Some((sx, sy, sw, sh)) = screen_of(window) else { return };
+    let width = BAR_MAX_WIDTH.min(sw - 2.0 * EDGE);
+    let height = BAR_H.load(Ordering::Relaxed) as f64;
+    let (mut x, mut y) = (sx + (sw - width) / 2.0, sy + BELOW_MENU_BAR);
+    if PINNED.load(Ordering::Relaxed) {
+        if let Some((mx, my)) = mini_pos() {
+            x = mx + MINI_W / 2.0 - width / 2.0;
+            y = my;
+        }
+    }
+    x = x.clamp(sx + EDGE, sx + sw - width - EDGE);
+    y = y.clamp(sy + BELOW_MENU_BAR - 8.0, (sy + sh - height - EDGE).max(sy + BELOW_MENU_BAR - 8.0));
+    let _ = window.set_size(LogicalSize::new(width, height));
+    let _ = window.set_position(LogicalPosition::new(x, y));
+}
+
+/// Mini widget: where you last dragged it, or top right under the menu bar.
+fn place_mini(window: &WebviewWindow) {
+    let Some((sx, sy, sw, sh)) = screen_of(window) else { return };
+    let (x, y) = mini_pos().unwrap_or((sx + sw - MINI_W - 16.0, sy + BELOW_MENU_BAR));
+    let x = x.clamp(sx, sx + sw - MINI_W);
+    let y = y.clamp(sy + 24.0, sy + sh - MINI_H);
+    set_mini_pos(x, y);
+    let _ = window.set_size(LogicalSize::new(MINI_W, MINI_H));
+    let _ = window.set_position(LogicalPosition::new(x, y));
+}
+
 /// On macOS the bar is an NSPanel (like Spotlight or Raycast): it floats over
 /// full-screen apps, shows on every desktop, and doesn't pull you out of the app you're in.
 #[cfg(target_os = "macos")]
@@ -112,6 +188,37 @@ mod mac {
                 is_floating_panel: true
             }
         })
+
+        panel_event!(BarEvents {
+            window_did_resign_key(notification: &NSNotification) -> (),
+            window_did_move(notification: &NSNotification) -> ()
+        })
+    }
+
+    pub fn make_panel(app: &AppHandle) {
+        let Some(window) = app.get_webview_window("main") else { return };
+        let Ok(panel) = window.to_panel::<BarPanel>() else { return };
+        panel.set_level(PanelLevel::Status.value());
+        let _ = panel.add_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .into(),
+        );
+
+        let events = BarEvents::new();
+        // Clicked anywhere else: close the bar (or shrink back to the mini widget).
+        let h = app.clone();
+        events.window_did_resign_key(move |_| {
+            let h2 = h.clone();
+            let _ = h.run_on_main_thread(move || super::on_click_away(&h2));
+        });
+        // Dragged the mini widget: remember where.
+        let h = app.clone();
+        events.window_did_move(move |_| super::on_moved(&h));
+        panel.set_event_handler(Some(events.as_ref()));
     }
 
     /// The celebration overlay: above everything (even the bar), on every desktop, never takes focus.
@@ -131,60 +238,180 @@ mod mac {
         );
     }
 
-    pub fn show_fx(app: &AppHandle) {
-        if let Ok(p) = app.get_webview_panel("fx") {
-            p.show();
-        }
-    }
-
-    pub fn hide_fx(app: &AppHandle) {
-        if let Ok(p) = app.get_webview_panel("fx") {
-            p.hide();
-        }
-    }
-
-    pub fn make_panel(app: &AppHandle) {
-        let Some(window) = app.get_webview_window("main") else { return };
-        let Ok(panel) = window.to_panel::<BarPanel>() else { return };
-        panel.set_level(PanelLevel::Status.value());
-        let _ = panel.add_style_mask(StyleMask::empty().nonactivating_panel().into());
-        panel.set_collection_behavior(
-            CollectionBehavior::new()
-                .full_screen_auxiliary()
-                .can_join_all_spaces()
-                .stationary()
-                .into(),
-        );
-    }
-
     pub fn is_open(app: &AppHandle) -> bool {
         app.get_webview_panel("main").map(|p| p.is_visible()).unwrap_or(false)
     }
-
-    pub fn show(app: &AppHandle) {
+    pub fn show_key(app: &AppHandle) {
         if let Ok(p) = app.get_webview_panel("main") {
             p.show_and_make_key();
         }
     }
-
+    pub fn show(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("main") {
+            p.show();
+        }
+    }
     pub fn hide(app: &AppHandle) {
         if let Ok(p) = app.get_webview_panel("main") {
             p.hide();
         }
     }
+    pub fn show_fx(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("fx") {
+            p.show();
+        }
+    }
+    pub fn hide_fx(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("fx") {
+            p.hide();
+        }
+    }
 }
 
-/// When the bar auto-hides because you clicked the menu bar icon, that same click
-/// shouldn't instantly reopen it.
-static LAST_AUTO_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+fn is_open(app: &AppHandle) -> bool {
+    #[cfg(target_os = "macos")]
+    return mac::is_open(app);
+    #[cfg(not(target_os = "macos"))]
+    return app.get_webview_window("main").map(|w| w.is_visible().unwrap_or(false)).unwrap_or(false);
+}
 
-fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+fn show_window(app: &AppHandle, key: bool) {
+    #[cfg(target_os = "macos")]
+    {
+        if key {
+            mac::show_key(app)
+        } else {
+            mac::show(app)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        if key {
+            let _ = w.set_focus();
+        }
+    }
+}
+
+fn hide_window(app: &AppHandle) {
+    #[cfg(target_os = "macos")]
+    mac::hide(app);
+    #[cfg(not(target_os = "macos"))]
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.hide();
+    }
+}
+
+/// Open the full bar.
+fn expand(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    EXPANDED.store(true, Ordering::Relaxed);
+    let _ = app.emit_to("main", "layout", "bar");
+    place_bar(&window);
+    show_window(app, true);
+    let _ = app.emit_to("main", "bar-shown", ());
+}
+
+/// Close the full bar: back to the mini widget if it's pinned, otherwise hide.
+fn collapse(app: &AppHandle) {
+    let Some(window) = app.get_webview_window("main") else { return };
+    EXPANDED.store(false, Ordering::Relaxed);
+    if PINNED.load(Ordering::Relaxed) {
+        let _ = app.emit_to("main", "layout", "mini");
+        place_mini(&window);
+        show_window(app, false);
+    } else {
+        hide_window(app);
+    }
+}
+
+fn toggle_bar(app: &AppHandle) {
+    if EXPANDED.load(Ordering::Relaxed) && is_open(app) {
+        collapse(app);
+        return;
+    }
+    if now_ms().saturating_sub(LAST_AUTO_HIDE_MS.load(Ordering::Relaxed)) < 350 {
+        return;
+    }
+    expand(app);
+}
+
+fn on_click_away(app: &AppHandle) {
+    if EXPANDED.load(Ordering::Relaxed) {
+        LAST_AUTO_HIDE_MS.store(now_ms(), Ordering::Relaxed);
+        collapse(app);
+    }
+}
+
+fn on_moved(app: &AppHandle) {
+    if !PINNED.load(Ordering::Relaxed) || EXPANDED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(window) = app.get_webview_window("main") else { return };
+    let (Ok(pos), Ok(scale)) = (window.outer_position(), window.scale_factor()) else { return };
+    let p = pos.to_logical::<f64>(scale);
+    set_mini_pos(p.x, p.y);
+    let _ = app.emit_to("main", "mini-moved", (p.x, p.y));
+}
+
+/* ---------- commands ---------- */
+
+/// Resize the bar (taller for the calendar).
+#[tauri::command]
+fn set_bar_height(app: AppHandle, height: u32) {
+    BAR_H.store(height.clamp(BAR_HEIGHT, BAR_MAX_TALL), Ordering::Relaxed);
+    if EXPANDED.load(Ordering::Relaxed) {
+        if let Some(window) = app.get_webview_window("main") {
+            place_bar(&window);
+        }
+    }
+}
+
+/// Turn the floating mini widget on or off. x/y restore where it was last dragged.
+#[tauri::command]
+fn set_pinned(app: AppHandle, pinned: bool, x: Option<f64>, y: Option<f64>) {
+    PINNED.store(pinned, Ordering::Relaxed);
+    if let (Some(x), Some(y)) = (x, y) {
+        set_mini_pos(x, y);
+    }
+    if !EXPANDED.load(Ordering::Relaxed) {
+        collapse(&app);
+    }
+}
+
+/// Esc, or the widget's expand button.
+#[tauri::command]
+fn dismiss(app: AppHandle) {
+    if EXPANDED.load(Ordering::Relaxed) {
+        collapse(&app);
+    }
+}
+
+#[tauri::command]
+fn expand_bar(app: AppHandle) {
+    expand(&app);
+}
+
+struct TrayItems {
+    flow: MenuItem<tauri::Wry>,
+    pin: MenuItem<tauri::Wry>,
+}
+
+/// Live flow time next to the menu bar icon (None clears it), and the menu's labels.
+#[tauri::command]
+fn set_tray_state(app: AppHandle, title: Option<String>, flowing: bool, pinned: bool) {
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        let _ = tray.set_title(title);
+    }
+    if let Some(items) = app.try_state::<TrayItems>() {
+        let _ = items.flow.set_text(if flowing { "End flow" } else { "Start flow" });
+        let _ = items.pin.set_text(if pinned { "Hide mini widget" } else { "Show mini widget" });
+    }
 }
 
 /// Cover the whole screen the bar is on with the celebration overlay and play it.
 #[tauri::command]
-fn celebrate(app: tauri::AppHandle, payload: serde_json::Value) {
+fn celebrate(app: AppHandle, payload: serde_json::Value) {
     let Some(fx) = app.get_webview_window("fx") else { return };
     let monitor = app
         .get_webview_window("main")
@@ -202,19 +429,9 @@ fn celebrate(app: tauri::AppHandle, payload: serde_json::Value) {
     let _ = app.emit_to("fx", "celebrate", payload);
 }
 
-/// Resize the bar (taller for the calendar), keeping it centred under the menu bar.
-#[tauri::command]
-fn set_bar_height(app: tauri::AppHandle, height: u32) {
-    let h = height.clamp(BAR_HEIGHT, BAR_MAX_TALL);
-    BAR_H.store(h, Ordering::Relaxed);
-    if let Some(window) = app.get_webview_window("main") {
-        place_bar(&window);
-    }
-}
-
 /// The overlay finished playing.
 #[tauri::command]
-fn fx_done(app: tauri::AppHandle) {
+fn fx_done(app: AppHandle) {
     #[cfg(target_os = "macos")]
     mac::hide_fx(&app);
     #[cfg(not(target_os = "macos"))]
@@ -223,56 +440,7 @@ fn fx_done(app: tauri::AppHandle) {
     }
 }
 
-/// Centre the bar at the top of whichever screen it's on, just under the menu bar.
-fn place_bar(window: &WebviewWindow) {
-    let monitor = window
-        .current_monitor()
-        .ok()
-        .flatten()
-        .or_else(|| window.primary_monitor().ok().flatten());
-    let Some(monitor) = monitor else { return };
-    let scale = monitor.scale_factor();
-    let size = monitor.size().to_logical::<f64>(scale);
-    let pos = monitor.position().to_logical::<f64>(scale);
-    let width = BAR_MAX_WIDTH.min(size.width - 40.0);
-    let height = BAR_H.load(Ordering::Relaxed) as f64;
-    let _ = window.set_size(LogicalSize::new(width, height));
-    let _ = window.set_position(LogicalPosition::new(
-        pos.x + (size.width - width) / 2.0,
-        pos.y + BELOW_MENU_BAR,
-    ));
-}
-
-fn toggle_bar(app: &tauri::AppHandle) {
-    let Some(window) = app.get_webview_window("main") else { return };
-
-    #[cfg(target_os = "macos")]
-    let open = mac::is_open(app);
-    #[cfg(not(target_os = "macos"))]
-    let open = window.is_visible().unwrap_or(false);
-
-    if open {
-        #[cfg(target_os = "macos")]
-        mac::hide(app);
-        #[cfg(not(target_os = "macos"))]
-        let _ = window.hide();
-        return;
-    }
-
-    if now_ms().saturating_sub(LAST_AUTO_HIDE_MS.load(Ordering::Relaxed)) < 300 {
-        return;
-    }
-
-    place_bar(&window);
-    #[cfg(target_os = "macos")]
-    mac::show(app);
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-    let _ = window.emit("bar-shown", ());
-}
+/* ---------- app ---------- */
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -282,7 +450,18 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![now_playing, idle_seconds, celebrate, fx_done, set_bar_height])
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .invoke_handler(tauri::generate_handler![
+            now_playing,
+            idle_seconds,
+            celebrate,
+            fx_done,
+            set_bar_height,
+            set_pinned,
+            dismiss,
+            expand_bar,
+            set_tray_state
+        ])
         .setup(|app| {
             // Menu bar only: no Dock icon.
             #[cfg(target_os = "macos")]
@@ -296,7 +475,7 @@ pub fn run() {
                     &window,
                     NSVisualEffectMaterial::HudWindow,
                     Some(NSVisualEffectState::Active),
-                    Some(34.0),
+                    Some(32.0),
                 );
             }
 
@@ -310,9 +489,26 @@ pub fn run() {
                 let _ = fx.set_ignore_cursor_events(true);
             }
 
-            let open = MenuItem::with_id(app, "open", "Open Lifescale HQ", true, None::<&str>)?;
+            // ⌥⇧Space opens the bar from anywhere. If another app already owns it, skip quietly.
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let _ = app.global_shortcut().on_shortcut("Alt+Shift+Space", |app, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        let h = app.clone();
+                        let _ = app.run_on_main_thread(move || toggle_bar(&h));
+                    }
+                });
+            }
+
+            let flow = MenuItem::with_id(app, "flow", "Start flow", true, None::<&str>)?;
+            let win = MenuItem::with_id(app, "win", "Log a win", true, None::<&str>)?;
+            let pin = MenuItem::with_id(app, "pin", "Show mini widget", true, None::<&str>)?;
+            let open = MenuItem::with_id(app, "open", "Open Lifescale HQ   ⌥⇧Space", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open, &quit])?;
+            let sep1 = PredefinedMenuItem::separator(app)?;
+            let sep2 = PredefinedMenuItem::separator(app)?;
+            let menu = Menu::with_items(app, &[&flow, &win, &sep1, &pin, &open, &sep2, &quit])?;
+            app.manage(TrayItems { flow: flow.clone(), pin: pin.clone() });
 
             let icon = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
@@ -325,7 +521,9 @@ pub fn run() {
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "open" => toggle_bar(app),
                     "quit" => app.exit(0),
-                    _ => {}
+                    other => {
+                        let _ = app.emit_to("main", "tray-action", other.to_string());
+                    }
                 })
                 .on_tray_icon_event(|tray, event| {
                     if let TrayIconEvent::Click {
@@ -344,21 +542,20 @@ pub fn run() {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(700));
                 let h = handle.clone();
-                let _ = handle.run_on_main_thread(move || toggle_bar(&h));
+                let _ = handle.run_on_main_thread(move || expand(&h));
             });
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Click anywhere else and the bar tucks itself away.
+            // Non-macOS fallback (on macOS the panel's own events handle this).
             if window.label() != "main" {
                 return;
             }
-            if let WindowEvent::Focused(false) = event {
-                if window.is_visible().unwrap_or(false) {
-                    LAST_AUTO_HIDE_MS.store(now_ms(), Ordering::Relaxed);
-                }
-                let _ = window.hide();
+            match event {
+                WindowEvent::Focused(false) => on_click_away(window.app_handle()),
+                WindowEvent::Moved(_) => on_moved(window.app_handle()),
+                _ => {}
             }
         })
         .run(tauri::generate_context!())

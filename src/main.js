@@ -49,6 +49,9 @@ const state = {
   flow: loadFlow(),
   tab: "now",
   updateReady: null,
+  layout: "bar",
+  screen: "auth",
+  pinned: false,
   banner: null,
   date: localDate(),
   channel: null,
@@ -303,6 +306,7 @@ function joinPresence() {
       );
     }
   });
+  ch.on("broadcast", { event: "poke" }, ({ payload }) => onPoke(payload));
   ch.subscribe((status) => {
     if (status === "SUBSCRIBED") track();
   });
@@ -471,15 +475,21 @@ function brandColumn() {
   return `
     <div class="brand">
       <div class="orb" title="Lifescale HQ"></div>
+      ${state.user ? `<button class="pin ${state.pinned ? "on" : ""}" id="pinbtn" title="Mini widget: keep a small bar on screen you can drag anywhere">${ICON_PIN}</button>` : ""}
       <div id="updateslot">${state.updateReady ? `<button class="update" id="doupdate" title="Version ${esc(state.updateReady)} is ready">Update</button>` : `<small>HQ</small>`}</div>
     </div>`;
 }
 
 function wireBrand() {
   app.querySelector("#doupdate")?.addEventListener("click", restartForUpdate);
+  app.querySelector("#pinbtn")?.addEventListener("click", togglePinned);
 }
 
 function renderShell() {
+  state.screen = "shell";
+  if (state.layout === "mini") return renderMini();
+  app.classList.remove("is-mini");
+  app.removeAttribute("data-tauri-drag-region");
   app.innerHTML = `
     ${brandColumn()}
     <div class="content" id="body"></div>
@@ -518,6 +528,7 @@ function renderBanner() {
 }
 
 function renderBody(animate = false) {
+  if (state.layout === "mini") return renderMini();
   const el = document.getElementById("body");
   if (!el) return;
   // Don't wipe what you're typing when a live update comes in.
@@ -551,7 +562,12 @@ function personTile(p) {
     : `<div class="p-sub">${online ? "Online now" : ps.kind === "away" ? `Away · active ${esc(agoShort(ps.lastMs))}` : ps.lastMs ? esc(ago(new Date(ps.lastMs).toISOString())) : "Offline"}</div>`;
 
   return `
-    <div class="tile glass grow">
+    <div class="tile glass grow person-tile">
+      <div class="react">
+        <button data-poke="nudge" title="Nudge ${esc(p.name.split(" ")[0])}">👊</button>
+        <button data-poke="fire" title="Send fire">🔥</button>
+        <button data-poke="call" title="Ask for a quick call">📞</button>
+      </div>
       <div class="p-head">
         ${avatar(p, { size: "lg", status })}
         <div style="min-width:0;flex:1">
@@ -728,7 +744,8 @@ function flash(id) {
 function wireBody(el) {
   wireCal(el);
   el.querySelector("#signout")?.addEventListener("click", signOut);
-  el.querySelector("#flowbtn")?.addEventListener("click", () => (state.flow ? stopFlow() : startFlow()));
+  el.querySelector("#flowbtn")?.addEventListener("click", toggleFlow);
+  el.querySelectorAll("[data-poke]").forEach((b) => b.addEventListener("click", () => sendPoke(b.dataset.poke)));
   el.querySelector("#savelog")?.addEventListener("click", async () => {
     const focus = el.querySelector("#focus").value.trim();
     const notes = el.querySelector("#notes").value.trim();
@@ -741,14 +758,7 @@ function wireBody(el) {
       }
     }
   });
-  el.querySelector("#winplus")?.addEventListener("click", async () => {
-    const before = standings(0);
-    const wins = (state.today?.wins || 0) + 1;
-    if (await saveToday({ wins })) {
-      renderBody();
-      celebrate(myWinCheer({ winsToday: wins, before, after: standings(0), userId: state.user.id, points: POINTS_PER_WIN }));
-    }
-  });
+  el.querySelector("#winplus")?.addEventListener("click", addWin);
   el.querySelector("#winminus")?.addEventListener("click", async () => {
     const w = state.today?.wins || 0;
     if (w > 0 && (await saveToday({ wins: w - 1 }))) renderBody();
@@ -770,6 +780,190 @@ function tick() {
     n.textContent = `In flow · ${clock((Date.now() - since) / 1000)}`;
   });
 }
+
+/* ---------- instant actions (shared by bar, mini widget, menu bar and keyboard) ---------- */
+
+function toggleFlow() {
+  if (!state.user) return;
+  return state.flow ? stopFlow() : startFlow();
+}
+
+async function addWin() {
+  if (!state.user) return;
+  const before = standings(0);
+  const wins = (state.today?.wins || 0) + 1;
+  if (await saveToday({ wins })) {
+    renderBody();
+    celebrate(myWinCheer({ winsToday: wins, before, after: standings(0), userId: state.user.id, points: POINTS_PER_WIN }));
+  }
+}
+
+/* ---------- mini widget ---------- */
+
+const PIN_KEY = "lshq.pinned";
+const MINI_POS_KEY = "lshq.miniPos";
+
+function loadPinned() {
+  try {
+    return localStorage.getItem(PIN_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function loadMiniPos() {
+  try {
+    const v = JSON.parse(localStorage.getItem(MINI_POS_KEY));
+    return Array.isArray(v) && v.length === 2 ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function syncPinned() {
+  if (!IN_APP) return;
+  const pos = loadMiniPos();
+  invoke("set_pinned", { pinned: !!state.pinned, x: pos?.[0] ?? null, y: pos?.[1] ?? null }).catch(() => {});
+  syncTray(true);
+}
+
+function togglePinned() {
+  state.pinned = !state.pinned;
+  try {
+    localStorage.setItem(PIN_KEY, state.pinned ? "1" : "0");
+  } catch {}
+  syncPinned();
+  const b = document.getElementById("pinbtn");
+  if (b) b.classList.toggle("on", state.pinned);
+  setBanner(state.pinned ? "Mini widget on. Drag it anywhere." : "Mini widget off.", "info", 3000);
+}
+
+const ICON_PIN = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="8" width="18" height="8" rx="4"/><circle cx="8" cy="12" r="1.4" fill="currentColor"/></svg>`;
+const ICON_EXPAND = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`;
+
+function miniPartnerBlock() {
+  const partner = state.profiles.find((p) => p.id !== state.user.id);
+  if (!partner) return `<div class="mini-them" data-tauri-drag-region><span class="hint">Waiting for Seva</span></div>`;
+  const ps = presenceStatus(partner);
+  const pres = ps.kind === "offline" ? null : state.presence[partner.id];
+  const flowStart = pres?.flow_started_at;
+  const status = flowStart ? "flow" : ps.kind === "online" ? "on" : ps.kind === "away" ? "away" : "";
+  const sub = flowStart
+    ? `<div class="p-sub flow" data-flow-since="${flowStart}">In flow</div>`
+    : `<div class="p-sub">${ps.kind === "online" ? "Online" : ps.kind === "away" ? `Away · ${esc(agoShort(ps.lastMs))}` : "Offline"}</div>`;
+  return `
+    <div class="mini-them" data-tauri-drag-region title="${esc(partner.name)}">
+      ${avatar(partner, { size: "sm", status })}
+      <div class="mini-txt"><b>${esc(partner.name.split(" ")[0])}</b>${sub}</div>
+    </div>`;
+}
+
+function renderMini() {
+  if (!state.user || !state.me) return;
+  const running = !!state.flow;
+  const st = streakFor(state.me);
+  app.classList.add("is-mini");
+  app.setAttribute("data-tauri-drag-region", "");
+  app.innerHTML = `
+    <div class="orb mini-orb" data-tauri-drag-region title="Drag to move"></div>
+    <button class="play mini-play ${running ? "stop" : ""}" id="miniflow" title="${running ? "End flow" : "Start flow"} (Space)">${running ? ICON_STOP : ICON_PLAY}</button>
+    <div class="mini-me" data-tauri-drag-region>
+      <div class="mini-clock ${running ? "live" : ""}" id="myclock">${running ? clock(flowElapsed()) : "Start flow"}</div>
+      <div class="hint">${hm(flowTodayFor(state.user.id, MY_TZ))} today${st.current ? ` · 🔥${st.current}` : ""}</div>
+    </div>
+    <div class="mini-sep"></div>
+    ${miniPartnerBlock()}
+    <button class="mini-btn" id="miniwin" title="Log a win">🏆</button>
+    <button class="mini-btn" id="mininudge" title="Nudge Seva">👊</button>
+    <button class="mini-btn icon" id="miniexpand" title="Open (⌥⇧Space)">${ICON_EXPAND}</button>`;
+  app.querySelector("#miniflow").addEventListener("click", toggleFlow);
+  app.querySelector("#miniwin").addEventListener("click", addWin);
+  app.querySelector("#mininudge").addEventListener("click", () => sendPoke("nudge"));
+  app.querySelector("#miniexpand").addEventListener("click", () => IN_APP && invoke("expand_bar").catch(() => {}));
+  tick();
+}
+
+function onLayout(layout) {
+  state.layout = layout;
+  if (layout === "mini") {
+    if (state.user && state.me) renderMini();
+    return;
+  }
+  app.classList.remove("is-mini");
+  app.removeAttribute("data-tauri-drag-region");
+  if (!state.user) return;
+  if (state.screen === "checkin") renderCheckin();
+  else if (state.screen === "shell") renderShell();
+}
+
+/* ---------- menu bar ---------- */
+
+let lastTray = "";
+function syncTray(force = false) {
+  if (!IN_APP) return;
+  const title = state.flow ? clock(flowElapsed()) : null;
+  const key = `${title}|${!!state.flow}|${!!state.pinned}`;
+  if (!force && key === lastTray) return;
+  lastTray = key;
+  invoke("set_tray_state", { title, flowing: !!state.flow, pinned: !!state.pinned }).catch(() => {});
+}
+
+/* ---------- nudges & reactions ---------- */
+
+const POKES = {
+  nudge: { icon: "👊", title: (n) => `${n} nudged you.`, subtitle: "Lock in.", sent: "Nudge sent 👊" },
+  fire: { icon: "🔥", title: (n) => `${n} sent you fire.`, subtitle: "Keep going.", sent: "Fire sent 🔥" },
+  clap: { icon: "👏", title: (n) => `${n} is clapping for you.`, subtitle: "Respect.", sent: "Clap sent 👏" },
+  call: { icon: "📞", title: (n) => `${n} wants a quick call.`, subtitle: "Hop on when you're free.", sent: "Call request sent 📞" },
+};
+const lastPoke = {};
+
+function sendPoke(kind) {
+  const partner = state.profiles.find((p) => p.id !== state.user?.id);
+  if (!partner || !state.channel || !POKES[kind]) return;
+  const now = Date.now();
+  if (lastPoke[kind] && now - lastPoke[kind] < 8000) {
+    setBanner("Easy, give it a second.", "info", 2000);
+    return;
+  }
+  lastPoke[kind] = now;
+  state.channel
+    .send({ type: "broadcast", event: "poke", payload: { from: state.user.id, fromName: state.me?.name, to: partner.id, kind } })
+    .catch(() => {});
+  setBanner(POKES[kind].sent, "info", 2500);
+}
+
+function onPoke(p) {
+  if (!p || p.to !== state.user?.id || !POKES[p.kind]) return;
+  const k = POKES[p.kind];
+  const name = String(p.fromName || "Your partner").split(" ")[0];
+  celebrate({ kind: "poke", icon: k.icon, title: k.title(name), subtitle: k.subtitle, chips: [], intensity: p.kind === "fire" ? 1 : 0, palette: "cool", duration: 3800 });
+}
+
+/* ---------- keyboard ---------- */
+
+function typing() {
+  const a = document.activeElement;
+  return a && /^(TEXTAREA|INPUT)$/.test(a.tagName);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    if (typing()) document.activeElement.blur();
+    if (IN_APP) invoke("dismiss").catch(() => {});
+    return;
+  }
+  if (typing() || e.metaKey || e.ctrlKey || e.altKey || !state.user || state.screen !== "shell") return;
+  if (e.code === "Space") {
+    e.preventDefault();
+    toggleFlow();
+  } else if (e.key === "w" || e.key === "W") {
+    addWin();
+  } else if (/^[1-4]$/.test(e.key) && state.layout !== "mini") {
+    const tab = TABS[Number(e.key) - 1];
+    app.querySelector(`[data-tab="${tab}"]`)?.click();
+  }
+});
 
 /* ---------- streaks & calendar ---------- */
 
@@ -1049,6 +1243,9 @@ function applyBarHeight() {
 
 function renderAuth(mode = "in", msg = "") {
   stopLoops();
+  state.screen = "auth";
+  app.classList.remove("is-mini");
+  app.removeAttribute("data-tauri-drag-region");
   document.documentElement.classList.remove("tall");
   setBarHeight(BAR_HEIGHT_PX);
   const err = msg.startsWith("!");
@@ -1090,6 +1287,10 @@ function renderAuth(mode = "in", msg = "") {
 }
 
 function renderCheckin() {
+  state.screen = "checkin";
+  if (state.layout === "mini") return renderMini();
+  app.classList.remove("is-mini");
+  app.removeAttribute("data-tauri-drag-region");
   document.documentElement.classList.remove("tall");
   setBarHeight(BAR_HEIGHT_PX);
   const first = (state.me?.name || "").split(" ")[0];
@@ -1198,6 +1399,7 @@ function secondTick() {
     return;
   }
   tick();
+  syncTray();
 }
 
 async function heartbeat() {
@@ -1252,6 +1454,8 @@ async function doEnter(user) {
   secondTick();
   joinPresence();
   startLoops();
+  state.pinned = loadPinned();
+  syncPinned();
   pollMusic();
   if (state.today?.focus) renderShell();
   else renderCheckin();
@@ -1306,6 +1510,8 @@ function maybeCrownYear() {
 
 async function signOut() {
   if (state.flow) await stopFlow(Date.now(), null, { quiet: true });
+  state.pinned = false;
+  syncPinned();
   stopLoops();
   state.user = null;
   await sb.auth.signOut();
@@ -1326,6 +1532,17 @@ sb.auth.onAuthStateChange((event, session) => {
 });
 
 if (IN_APP) {
+  listen("layout", (e) => onLayout(e.payload)).catch(() => {});
+  listen("mini-moved", (e) => {
+    try {
+      localStorage.setItem(MINI_POS_KEY, JSON.stringify(e.payload));
+    } catch {}
+  }).catch(() => {});
+  listen("tray-action", (e) => {
+    if (e.payload === "flow") toggleFlow();
+    else if (e.payload === "win") addWin();
+    else if (e.payload === "pin") togglePinned();
+  }).catch(() => {});
   listen("bar-shown", () => {
     app.classList.remove("drop");
     void app.offsetWidth;
@@ -1334,3 +1551,6 @@ if (IN_APP) {
   setTimeout(checkForUpdate, 5000);
   setInterval(checkForUpdate, 3 * 60 * 60 * 1000);
 }
+
+// Browser previews only: switch layouts by hand.
+if (!IN_APP) window.__layout = onLayout;

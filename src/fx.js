@@ -115,10 +115,11 @@ function frame() {
 
 function show(c) {
   const palette = PALETTES[c.palette] || PALETTES.warm;
-  const intensity = c.intensity || 2;
+  const intensity = c.intensity ?? 2;
   const total = c.duration || (intensity >= 3 ? 6000 : intensity === 2 ? 5000 : 4200);
-  const rocketsToFire = { 1: 3, 2: 6, 3: 11 }[intensity] || 6;
-  const small = c.kind === "partner";
+  const intensityLevel = c.intensity ?? 2;
+  const rocketsToFire = { 0: 0, 1: 3, 2: 6, 3: 11 }[intensityLevel] ?? 6;
+  const small = c.kind === "partner" || c.kind === "poke";
 
   stage.innerHTML = `
     <div class="card ${small ? "small" : ""}" style="--glow:${palette.glow}">
@@ -133,8 +134,10 @@ function show(c) {
 
   // Opening volley around the card, then a staggered show.
   const W = canvas.width;
-  launch(palette, { x: W * 0.32, ty: canvas.height * 0.2 });
-  launch(palette, { x: W * 0.68, ty: canvas.height * 0.22 });
+  if (rocketsToFire > 0) {
+    launch(palette, { x: W * 0.32, ty: canvas.height * 0.2 });
+    launch(palette, { x: W * 0.68, ty: canvas.height * 0.22 });
+  }
   for (let i = 2; i < rocketsToFire; i++) setTimeout(() => launch(palette), 250 + i * rand(260, 420));
 
   running = true;

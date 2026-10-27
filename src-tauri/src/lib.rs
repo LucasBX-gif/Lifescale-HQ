@@ -85,6 +85,28 @@ async fn idle_seconds() -> Option<u64> {
     None
 }
 
+/// Let the bar appear over full-screen apps and on every desktop, floating at menu level.
+#[cfg(target_os = "macos")]
+fn float_everywhere(window: &WebviewWindow) {
+    use objc2::{msg_send, runtime::AnyObject};
+    let Ok(ptr) = window.ns_window() else { return };
+    if ptr.is_null() {
+        return;
+    }
+    // canJoinAllSpaces | stationary | ignoresCycle | fullScreenAuxiliary
+    let behavior: usize = (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8);
+    // NSPopUpMenuWindowLevel: above full-screen windows, like a menu.
+    let level: isize = 101;
+    unsafe {
+        let ns_window: &AnyObject = &*(ptr as *mut AnyObject);
+        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
+        let _: () = msg_send![ns_window, setLevel: level];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn float_everywhere(_window: &WebviewWindow) {}
+
 /// Centre the bar at the top of whichever screen it's on, just under the menu bar.
 fn place_bar(window: &WebviewWindow) {
     let monitor = window
@@ -110,6 +132,7 @@ fn toggle_bar(app: &tauri::AppHandle) {
             let _ = window.hide();
         } else {
             place_bar(&window);
+            float_everywhere(&window);
             let _ = window.show();
             let _ = window.set_focus();
             let _ = window.emit("bar-shown", ());

@@ -1833,8 +1833,9 @@ dependencies = [
 
 [[package]]
 name = "lifescale-hq"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
+ "objc2",
  "serde",
  "serde_json",
  "tauri",

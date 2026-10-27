@@ -1,5 +1,7 @@
 use serde::Serialize;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
     menu::{Menu, MenuItem},
@@ -85,27 +87,60 @@ async fn idle_seconds() -> Option<u64> {
     None
 }
 
-/// Let the bar appear over full-screen apps and on every desktop, floating at menu level.
+/// On macOS the bar is an NSPanel (like Spotlight or Raycast): it floats over
+/// full-screen apps, shows on every desktop, and doesn't pull you out of the app you're in.
 #[cfg(target_os = "macos")]
-fn float_everywhere(window: &WebviewWindow) {
-    use objc2::{msg_send, runtime::AnyObject};
-    let Ok(ptr) = window.ns_window() else { return };
-    if ptr.is_null() {
-        return;
+mod mac {
+    use tauri::{AppHandle, Manager};
+    use tauri_nspanel::{tauri_panel, CollectionBehavior, ManagerExt, PanelLevel, StyleMask, WebviewWindowExt};
+
+    tauri_panel! {
+        panel!(BarPanel {
+            config: {
+                can_become_key_window: true,
+                is_floating_panel: true
+            }
+        })
     }
-    // canJoinAllSpaces | stationary | ignoresCycle | fullScreenAuxiliary
-    let behavior: usize = (1 << 0) | (1 << 4) | (1 << 6) | (1 << 8);
-    // NSPopUpMenuWindowLevel: above full-screen windows, like a menu.
-    let level: isize = 101;
-    unsafe {
-        let ns_window: &AnyObject = &*(ptr as *mut AnyObject);
-        let _: () = msg_send![ns_window, setCollectionBehavior: behavior];
-        let _: () = msg_send![ns_window, setLevel: level];
+
+    pub fn make_panel(app: &AppHandle) {
+        let Some(window) = app.get_webview_window("main") else { return };
+        let Ok(panel) = window.to_panel::<BarPanel>() else { return };
+        panel.set_level(PanelLevel::Status.value());
+        let _ = panel.add_style_mask(StyleMask::empty().nonactivating_panel().into());
+        panel.set_collection_behavior(
+            CollectionBehavior::new()
+                .full_screen_auxiliary()
+                .can_join_all_spaces()
+                .stationary()
+                .into(),
+        );
+    }
+
+    pub fn is_open(app: &AppHandle) -> bool {
+        app.get_webview_panel("main").map(|p| p.is_visible()).unwrap_or(false)
+    }
+
+    pub fn show(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("main") {
+            p.show_and_make_key();
+        }
+    }
+
+    pub fn hide(app: &AppHandle) {
+        if let Ok(p) = app.get_webview_panel("main") {
+            p.hide();
+        }
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn float_everywhere(_window: &WebviewWindow) {}
+/// When the bar auto-hides because you clicked the menu bar icon, that same click
+/// shouldn't instantly reopen it.
+static LAST_AUTO_HIDE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+}
 
 /// Centre the bar at the top of whichever screen it's on, just under the menu bar.
 fn place_bar(window: &WebviewWindow) {
@@ -127,22 +162,42 @@ fn place_bar(window: &WebviewWindow) {
 }
 
 fn toggle_bar(app: &tauri::AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        if window.is_visible().unwrap_or(false) {
-            let _ = window.hide();
-        } else {
-            place_bar(&window);
-            float_everywhere(&window);
-            let _ = window.show();
-            let _ = window.set_focus();
-            let _ = window.emit("bar-shown", ());
-        }
+    let Some(window) = app.get_webview_window("main") else { return };
+
+    #[cfg(target_os = "macos")]
+    let open = mac::is_open(app);
+    #[cfg(not(target_os = "macos"))]
+    let open = window.is_visible().unwrap_or(false);
+
+    if open {
+        #[cfg(target_os = "macos")]
+        mac::hide(app);
+        #[cfg(not(target_os = "macos"))]
+        let _ = window.hide();
+        return;
     }
+
+    if now_ms().saturating_sub(LAST_AUTO_HIDE_MS.load(Ordering::Relaxed)) < 300 {
+        return;
+    }
+
+    place_bar(&window);
+    #[cfg(target_os = "macos")]
+    mac::show(app);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+    let _ = window.emit("bar-shown", ());
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(target_os = "macos")]
+    let builder = builder.plugin(tauri_nspanel::init());
+    builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![now_playing, idle_seconds])
@@ -162,6 +217,9 @@ pub fn run() {
                     Some(34.0),
                 );
             }
+
+            #[cfg(target_os = "macos")]
+            mac::make_panel(app.handle());
 
             let open = MenuItem::with_id(app, "open", "Open Lifescale HQ", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -205,6 +263,9 @@ pub fn run() {
         .on_window_event(|window, event| {
             // Click anywhere else and the bar tucks itself away.
             if let WindowEvent::Focused(false) = event {
+                if window.is_visible().unwrap_or(false) {
+                    LAST_AUTO_HIDE_MS.store(now_ms(), Ordering::Relaxed);
+                }
                 let _ = window.hide();
             }
         })

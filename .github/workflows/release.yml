@@ -1,4 +1,5 @@
 name: Build Mac app
+# Builds the Lifescale HQ Mac app and publishes it to Releases.
 
 on:
   push:

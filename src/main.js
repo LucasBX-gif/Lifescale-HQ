@@ -462,9 +462,8 @@ function personHues(p) {
 }
 
 function avatar(p, { size = "", status = null } = {}) {
-  const [a, b] = personHues(p);
   const st = status !== null ? `<span class="st ${status}"></span>` : "";
-  return `<div class="av ${size}" style="--c1:hsl(${a} 80% 64%);--c2:hsl(${b} 85% 54%)">${esc(initials(p?.name))}${st}</div>`;
+  return `<div class="av ${size}" style="--ring:${personColor(p)}">${esc(initials(p?.name))}${st}</div>`;
 }
 
 function ringOffset(seconds) {
@@ -598,8 +597,8 @@ function meTile() {
         <svg viewBox="0 0 108 108">
           <defs>
             <linearGradient id="ringgrad" x1="0" y1="0" x2="1" y2="1">
-              <stop offset="0" stop-color="#ffb547"/>
-              <stop offset="1" stop-color="#ff7ab6"/>
+              <stop offset="0" stop-color="#ff9a3d"/>
+              <stop offset="1" stop-color="#ff6a00"/>
             </linearGradient>
           </defs>
           <circle class="track" cx="54" cy="54" r="${RING_R}" fill="none" stroke-width="7"/>
@@ -713,7 +712,7 @@ function boardView() {
         ${avatar({ id: r.userId, name: r.name }, { size: "sm" })}
         <div class="who">
           <b>${esc(r.name)}</b><small>${hm(r.flowSec)} flow · ${r.wins} ${r.wins === 1 ? "win" : "wins"} · ${r.fullDays} full ${r.fullDays === 1 ? "day" : "days"}</small>
-          <div class="bar"><i style="width:${Math.round((r.points / max) * 100)}%"></i></div>
+          <div class="bar"><i style="width:${Math.round((r.points / max) * 100)}%;background:${personColor({ id: r.userId })}"></i></div>
         </div>
         <span class="pts">${r.points}</span>
       </div>`
@@ -977,9 +976,11 @@ function tzFor(p) {
   return state.presence[p.id]?.tz || p.timezone || "UTC";
 }
 
-function personColor(p, light = 64) {
-  const [a] = personHues(p);
-  return `hsl(${a} 90% ${light}%)`;
+// You are white, everyone else is orange (so on Seva's Mac, he's white and you're orange).
+const ME_COLOR = "#ffffff";
+const THEM_COLOR = "#ff7a1a";
+function personColor(p) {
+  return p?.id && state.user && p.id === state.user.id ? ME_COLOR : THEM_COLOR;
 }
 
 function daysFor(p) {
@@ -1171,7 +1172,7 @@ function yearView(c, people) {
       <div class="rank ${i === 0 && ys.result.kind === "winner" ? "lead" : ""}">
         ${avatar(t.p, { size: "sm" })}
         <div class="who"><b>${esc(t.name.split(" ")[0])}</b><small>${t.crowns} ${t.crowns === 1 ? "crown" : "crowns"} · ${hm(t.flowSec)} flow</small>
-          <div class="bar"><i style="width:${Math.round((t.points / maxTotal) * 100)}%"></i></div></div>
+          <div class="bar"><i style="width:${Math.round((t.points / maxTotal) * 100)}%;background:${personColor(t.p)}"></i></div></div>
         <span class="pts">${t.points}</span>
       </div>`
     )

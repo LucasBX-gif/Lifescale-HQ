@@ -435,3 +435,143 @@ textarea:focus, input:focus { box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25), i
 }
 .mini-btn:hover { background: var(--glass-press); }
 .mini-btn.icon svg { width: 15px; height: 15px; }
+
+/* =========================================================
+   BLACK & WHITE THEME
+   Black is the structure, white is the writing.
+   Orange = live / important (flow, leader, streak, update, Seva).
+   Green = online. Red = errors.
+   ========================================================= */
+:root {
+  --text: #ffffff;
+  --muted: #9a9a9a;
+  --faint: #5e5e5e;
+  --glass: #111111;
+  --glass-hi: #1c1c1c;
+  --glass-press: #262626;
+  --stroke: #1e1e1e;
+  --edge: #2a2a2a;
+  --orange: #ff7a1a;
+  --orange-dim: rgba(255, 122, 26, 0.14);
+  --amber: var(--orange);
+  --gold: var(--orange);
+  --green: #3ddc84;
+  --red: #ff5a5a;
+}
+
+html:not(.native) body { background: #3a3a40; }
+
+#app,
+html:not(.native) #app {
+  background: #000;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: inset 0 0 0 1px #1d1d1d;
+}
+#app::before { display: none; }
+
+.glass {
+  background: var(--glass);
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: inset 0 0 0 1px var(--stroke);
+}
+
+/* Logo: a white ring with an orange core. */
+.orb,
+.orb.big {
+  background: radial-gradient(circle, var(--orange) 0 26%, transparent 27%), #000;
+  box-shadow: inset 0 0 0 2.5px #fff;
+  animation: none;
+  filter: none;
+}
+.orb.big { box-shadow: inset 0 0 0 4px #fff; }
+.brand small { color: var(--faint); }
+
+/* Avatars: dark circle, white initials, coloured ring (you white, them orange). */
+.av {
+  background: #161616;
+  color: #fff;
+  box-shadow: inset 0 0 0 1.5px var(--ring, #fff);
+}
+.av .st { background: #3a3a3a; box-shadow: 0 0 0 2.5px #000; }
+.av .st.on { background: var(--green); }
+.av .st.flow { background: var(--orange); }
+.av .st.away { background: #000; box-shadow: 0 0 0 2.5px #000, inset 0 0 0 2px var(--muted); }
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 2.5px #000, 0 0 0 2.5px rgba(255, 122, 26, 0.5); }
+  50% { box-shadow: 0 0 0 2.5px #000, 0 0 0 7px rgba(255, 122, 26, 0); }
+}
+.av.sm .st { box-shadow: 0 0 0 2px #000; }
+
+/* Nav and segmented controls */
+.nav-thumb, .tab-thumb { background: #232323; box-shadow: none; }
+.seg button.on { background: #232323; box-shadow: none; }
+
+/* Text accents */
+.p-sub.flow, .clock.live, .mini-clock.live, .crown, .crown-big, .streak, .mname .live { color: var(--orange); text-shadow: none; }
+.p-name .crown { text-shadow: none; }
+
+/* Chips */
+.chip { background: #161616; box-shadow: none; }
+.chip.music { background: #161616; }
+.eq i { background: var(--green); }
+
+/* Timer */
+.ring .track { stroke: #1d1d1d; }
+.ring .prog { filter: none; }
+.play { background: #fff; color: #000; box-shadow: none; }
+.play.stop { background: var(--orange); color: #000; box-shadow: 0 0 0 4px var(--orange-dim); }
+.mini-play { box-shadow: none; }
+.mini-play.stop { box-shadow: 0 0 0 3px var(--orange-dim); }
+
+/* Buttons */
+.pill { background: #1c1c1c; box-shadow: none; }
+.pill:hover { background: #262626; }
+.pill.primary { background: #fff; color: #000; box-shadow: none; }
+.stepper button, .react button, .mini-btn, .arrow, .pin { background: #1a1a1a; box-shadow: none; }
+.stepper button:hover, .react button:hover, .mini-btn:hover, .arrow:hover, .pin:hover { background: #262626; }
+.pin.on { background: #fff; color: #000; }
+.update { background: var(--orange); color: #000; box-shadow: none; }
+.saved { color: var(--green); }
+
+/* Inputs */
+textarea, input { background: #0a0a0a; box-shadow: inset 0 0 0 1px #222; }
+textarea:focus, input:focus { box-shadow: inset 0 0 0 1px #555, 0 0 0 3px rgba(255, 255, 255, 0.06); }
+
+/* Board */
+.hero::after { display: none; }
+.bar { background: #1a1a1a; }
+.bar i { background: #fff; }
+.rank.lead .bar i { background: var(--orange); }
+.rank.lead .pts, .score .row.lead .pts { color: var(--orange); }
+.rank + .rank { border-top-color: #1c1c1c; }
+.eoy { border-bottom-color: #1c1c1c; }
+
+/* Calendar */
+.day { background: #0d0d0d; box-shadow: inset 0 0 0 1px #171717; }
+.day:hover { background: #161616; }
+.day.today .dnum { color: var(--orange); }
+.day.today { box-shadow: inset 0 0 0 1px #2a2a2a; }
+.day.sel { background: #1a1a1a; box-shadow: inset 0 0 0 1.5px #fff; }
+.dbar { background: #1a1a1a; }
+.dcrown { filter: none; }
+.mtile:hover { background: #161616; }
+.mtile.live { box-shadow: inset 0 0 0 1.5px var(--orange); }
+.dd-person + .dd-person { border-top-color: #1c1c1c; }
+
+/* Mini widget */
+.mini-sep { background: #262626; }
+
+/* Toasts */
+.toast, .banner { background: #111; color: #fff; box-shadow: inset 0 0 0 1px #262626, 0 8px 24px rgba(0, 0, 0, 0.5); }
+.toast.err, .banner.err { background: #1a0808; color: #ff9a9a; box-shadow: inset 0 0 0 1px #4a1a1a; }
+.msg { color: var(--muted); }
+.msg.err { color: #ff9a9a; }
+
+/* Orange belongs to the other person, so the leader is marked by the crown, not by colour. */
+.rank.lead .pts, .score .row.lead .pts { color: var(--text); }
+.crown-big { color: var(--text); }
+.mini-orb { width: 26px; height: 26px; box-shadow: inset 0 0 0 2px #fff; }
+.hero .crown-big, .eoy .crown-big { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); white-space: nowrap; }
+.eoy .crown-big { font-size: 11px; }

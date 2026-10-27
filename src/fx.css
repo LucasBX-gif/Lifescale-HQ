@@ -99,3 +99,18 @@ html.preview body {
 .card.small .icon { font-size: 38px; }
 .card.small .title { font-size: 24px; }
 .card.small .sub { font-size: 14px; }
+
+/* Black & white card: black structure, white writing, orange accents. */
+.card {
+  background: #000;
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+  box-shadow: inset 0 0 0 1px #262626, 0 30px 80px rgba(0, 0, 0, 0.6);
+}
+.card::before { display: none; }
+.card::after { display: none; }
+.sub { color: #9a9a9a; }
+.badge { background: #ff7a1a; color: #000; box-shadow: none; }
+.chip { background: #141414; box-shadow: none; color: #fff; }
+.chip:first-child { color: #ff7a1a; }
+.chip.lead { color: #ff7a1a; background: rgba(255, 122, 26, 0.12); box-shadow: none; }

@@ -13,7 +13,9 @@ import {
   CHEER_MIN_FLOW_MINUTES,
   CHEER_MIN_PARTNER_FLOW_MINUTES,
 } from "./config.js";
-import { myFlowCheer, myWinCheer, myDayCheer, partnerFlowCheer, partnerWinCheer, crownCheer } from "./cheers.js";
+import { dayMap, streaks, isActive, monthGrid, winnerOf, STREAK_MILESTONES } from "./calendar.js";
+import { clockLabel, hourOf } from "./cheers.js";
+import { myFlowCheer, myWinCheer, myDayCheer, partnerFlowCheer, partnerWinCheer, crownCheer, streakCheer, yearCrownCheer } from "./cheers.js";
 
 const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
   auth: { persistSession: true, autoRefreshToken: true, detectSessionInUrl: false },
@@ -158,16 +160,50 @@ async function loadProfiles() {
   state.me = state.profiles.find((p) => p.id === state.user.id) || null;
 }
 
+/** Supabase returns at most 1000 rows per request, so page through. */
+async function fetchAll(build) {
+  const out = [];
+  for (let from = 0; ; from += 1000) {
+    const { data, error } = await build().range(from, from + 999);
+    if (error) throw error;
+    out.push(...(data || []));
+    if (!data || data.length < 1000) return out;
+  }
+}
+
+// History back to 1 January last year: enough for streaks, the calendar and both year views.
+function historyStart() {
+  return new Date(new Date().getFullYear() - 1, 0, 1);
+}
+
 async function loadActivity() {
-  // Last month + this month is plenty for the board and today's stats.
-  const since = monthRange(-1).start;
-  const [s, l] = await Promise.all([
-    sb.from("flow_sessions").select("*").gte("started_at", since.toISOString()).order("started_at"),
-    sb.from("daily_logs").select("*").gte("log_date", ymd(new Date(since.getTime() - 86400000))),
-  ]);
-  state.sessions = s.data || [];
-  state.logs = l.data || [];
+  const since = historyStart();
+  try {
+    const [sessions, logs] = await Promise.all([
+      fetchAll(() => sb.from("flow_sessions").select("*").gte("started_at", new Date(since.getTime() - 86400000).toISOString()).order("started_at")),
+      fetchAll(() => sb.from("daily_logs").select("*").gte("log_date", ymd(new Date(since.getTime() - 86400000))).order("log_date")),
+    ]);
+    state.sessions = sessions;
+    state.logs = logs;
+  } catch (e) {
+    setBanner(`Couldn't load history: ${e.message}`, "err");
+  }
   state.today = state.logs.find((x) => x.user_id === state.user.id && x.log_date === state.date) || null;
+}
+
+/** Apply a live database change without reloading everything. */
+function mergeChange(list, change) {
+  if (change.eventType === "DELETE") {
+    const id = change.old?.id;
+    return id ? list.filter((x) => x.id !== id) : list;
+  }
+  const row = change.new;
+  if (!row?.id) return list;
+  const i = list.findIndex((x) => x.id === row.id);
+  if (i === -1) return list.concat(row);
+  const copy = list.slice();
+  copy[i] = row;
+  return copy;
 }
 
 async function saveToday(patch) {
@@ -188,6 +224,7 @@ async function saveToday(patch) {
   state.today = data;
   state.logs = state.logs.filter((x) => !(x.user_id === data.user_id && x.log_date === data.log_date)).concat(data);
   track();
+  checkStreak();
   return true;
 }
 
@@ -221,17 +258,19 @@ function joinPresence() {
   ch.on("postgres_changes", { event: "*", schema: "public", table: "daily_logs" }, async (change) => {
     const row = change.new;
     const prevWins = row ? state.logs.find((l) => l.user_id === row.user_id && l.log_date === row.log_date)?.wins || 0 : 0;
-    await loadActivity();
+    state.logs = mergeChange(state.logs, change);
+    state.today = state.logs.find((x) => x.user_id === state.user.id && x.log_date === state.date) || null;
     renderBody();
     if (row && row.user_id !== state.user.id && (row.wins || 0) > prevWins) {
       const who = state.profiles.find((p) => p.id === row.user_id);
       celebrate(partnerWinCheer({ name: who?.name, winsToday: row.wins, after: standings(0), myId: state.user.id }));
     }
   });
-  ch.on("postgres_changes", { event: "INSERT", schema: "public", table: "flow_sessions" }, async (change) => {
-    const row = change.new;
-    await loadActivity();
+  ch.on("postgres_changes", { event: "*", schema: "public", table: "flow_sessions" }, async (change) => {
+    state.sessions = mergeChange(state.sessions, change);
     renderBody();
+    if (change.eventType !== "INSERT") return;
+    const row = change.new;
     if (row && row.user_id !== state.user.id && row.seconds >= CHEER_MIN_PARTNER_FLOW_MINUTES * 60) {
       const who = state.profiles.find((p) => p.id === row.user_id);
       const tz = state.presence[row.user_id]?.tz || who?.timezone || "UTC";
@@ -276,16 +315,23 @@ async function stopFlow(endAt = Date.now(), reason = null, { idle = false, quiet
   const longestBeforeSec = state.sessions
     .filter((x) => x.user_id === state.user.id && new Date(x.started_at).getTime() >= monthStart)
     .reduce((m, x) => Math.max(m, x.seconds), 0);
-  const { error } = await sb.from("flow_sessions").insert({
-    user_id: state.user.id,
-    task: flow.task,
-    started_at: new Date(flow.startedAt).toISOString(),
-    ended_at: new Date(endAt).toISOString(),
-    seconds: Math.min(seconds, 43200),
-  });
+  const { data: inserted, error } = await sb
+    .from("flow_sessions")
+    .insert({
+      user_id: state.user.id,
+      task: flow.task,
+      started_at: new Date(flow.startedAt).toISOString(),
+      ended_at: new Date(endAt).toISOString(),
+      seconds: Math.min(seconds, 43200),
+    })
+    .select()
+    .single();
   if (error) setBanner(`Couldn't log session: ${error.message}`, "err");
-  else setBanner(reason ? `${reason} Logged ${hm(seconds)}.` : `Logged ${hm(seconds)} of flow.`);
-  await loadActivity();
+  else {
+    setBanner(reason ? `${reason} Logged ${hm(seconds)}.` : `Logged ${hm(seconds)} of flow.`);
+    state.sessions = mergeChange(state.sessions, { eventType: "INSERT", new: inserted });
+    checkStreak();
+  }
   renderBody();
   if (!error && !quiet && seconds >= CHEER_MIN_FLOW_MINUTES * 60) {
     celebrate(
@@ -355,7 +401,7 @@ function latestLogFor(userId, tz) {
 
 /* ---------- rendering ---------- */
 
-const TABS = ["now", "log", "board"];
+const TABS = ["now", "log", "board", "cal"];
 const RING_R = 46;
 const RING_C = 2 * Math.PI * RING_R;
 
@@ -365,8 +411,9 @@ const NAV_ICONS = {
   now: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 19c.8-3 3-4.6 5.5-4.6s4.7 1.6 5.5 4.6"/><circle cx="17" cy="9" r="2.4"/><path d="M15.8 14.6c2.2.1 3.9 1.5 4.6 4"/></svg>`,
   log: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h4L19 9a2.8 2.8 0 0 0-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></svg>`,
   board: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"><path d="M3 8l4.5 4L12 5l4.5 7L21 8l-2 11H5L3 8z"/></svg>`,
+  cal: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3.5" y="5" width="17" height="15.5" rx="3.5"/><path d="M3.5 10h17M8 3v4M16 3v4"/></svg>`,
 };
-const NAV_TITLES = { now: "Now", log: "Log your day", board: "Employee of the month" };
+const NAV_TITLES = { now: "Now", log: "Log your day", board: "Employee of the month", cal: "Calendar & streaks" };
 
 function initials(name) {
   const parts = String(name || "?").trim().split(/\s+/).slice(0, 2);
@@ -379,8 +426,15 @@ function hues(seed) {
   return [h, (h + 55) % 360];
 }
 
+// Each person gets a fixed, clearly different colour, by sign-up order (same on both Macs).
+const PERSON_HUES = [[262, 222], [32, 352], [168, 200], [330, 290]];
+function personHues(p) {
+  const i = state.profiles.findIndex((x) => x.id === p?.id);
+  return i >= 0 ? PERSON_HUES[i % PERSON_HUES.length] : hues(p?.id || p?.name);
+}
+
 function avatar(p, { size = "", status = null } = {}) {
-  const [a, b] = hues(p?.id || p?.name);
+  const [a, b] = personHues(p);
   const st = status !== null ? `<span class="st ${status}"></span>` : "";
   return `<div class="av ${size}" style="--c1:hsl(${a} 80% 64%);--c2:hsl(${b} 85% 54%)">${esc(initials(p?.name))}${st}</div>`;
 }
@@ -415,12 +469,14 @@ function renderShell() {
     b.addEventListener("click", () => {
       if (state.tab === b.dataset.tab) return;
       state.tab = b.dataset.tab;
+      applyBarHeight();
       app.querySelector("#nav").style.setProperty("--i", TABS.indexOf(state.tab));
       app.querySelectorAll("[data-tab]").forEach((x) => x.classList.toggle("on", x === b));
       renderBody(true);
     })
   );
   renderBanner();
+  applyBarHeight();
   renderBody(true);
 }
 
@@ -447,7 +503,7 @@ function renderBody(animate = false) {
     return;
   }
   el.className = `content${animate ? " fade" : ""}`;
-  el.innerHTML = state.tab === "now" ? nowView() : state.tab === "log" ? logView() : boardView();
+  el.innerHTML = state.tab === "now" ? nowView() : state.tab === "log" ? logView() : state.tab === "cal" ? calView() : boardView();
   wireBody(el);
   tick();
 }
@@ -481,9 +537,10 @@ function personTile(p) {
       ${focus ? `<div class="clamp${np ? " one" : ""}">${esc(focus)}</div>` : `<div class="clamp empty">Hasn't checked in today</div>`}
       <div class="chips">
         ${np ? `<span class="chip music" title="${esc(np.track)} · ${esc(np.artist)}"><span class="eq"><i></i><i></i><i></i></span><span class="txt"><b>${esc(np.track)}</b> · ${esc(np.artist)}</span></span>` : ""}
+        ${(() => { const st = streakFor(p); return st.current ? `<span class="chip" title="${st.current} day streak">🔥 <b>${st.current}</b></span>` : ""; })()}
         <span class="chip"><b>${esc(timeIn(tz))}</b>${offset ? esc(offset) : ""}</span>
-        <span class="chip">Flow <b>${hm(flowTodayFor(p.id, tz))}</b></span>
-        ${np ? "" : `<span class="chip">Wins <b>${log?.wins || 0}</b></span>`}
+        <span class="chip" title="Flow today">⏱ <b>${hm(flowTodayFor(p.id, tz))}</b></span>
+        ${np ? "" : `<span class="chip" title="Wins today">🏆 <b>${log?.wins || 0}</b></span>`}
       </div>
     </div>`;
 }
@@ -535,7 +592,7 @@ function scoreTile() {
       (r, i) => `
       <div class="row ${i === 0 && r.points > 0 && !tie ? "lead" : ""}">
         ${avatar({ id: r.userId, name: r.name }, { size: "sm" })}
-        <span class="nm">${esc(r.name.split(" ")[0])}${i === 0 && r.points > 0 && !tie ? ` <span class="crown">♛</span>` : ""}</span>
+        <span class="nm">${esc(r.name.split(" ")[0])}${i === 0 && r.points > 0 && !tie ? ` <span class="crown">♛</span>` : ""}${(() => { const pp = state.profiles.find((x) => x.id === r.userId); const st = pp ? streakFor(pp) : null; return st?.current ? ` <span class="streak" title="${st.current} day streak">🔥${st.current}</span>` : ""; })()}</span>
         <span class="pts">${r.points}</span>
       </div>`
     )
@@ -644,6 +701,7 @@ function flash(id) {
 }
 
 function wireBody(el) {
+  wireCal(el);
   el.querySelector("#signout")?.addEventListener("click", signOut);
   el.querySelector("#flowbtn")?.addEventListener("click", () => (state.flow ? stopFlow() : startFlow()));
   el.querySelector("#savelog")?.addEventListener("click", async () => {
@@ -688,10 +746,286 @@ function tick() {
   });
 }
 
+/* ---------- streaks & calendar ---------- */
+
+const CAL_HEIGHT = 480;
+const BAR_HEIGHT_PX = 156;
+const WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+function tzFor(p) {
+  if (p.id === state.user.id) return MY_TZ;
+  return state.presence[p.id]?.tz || p.timezone || "UTC";
+}
+
+function personColor(p, light = 64) {
+  const [a] = personHues(p);
+  return `hsl(${a} 90% ${light}%)`;
+}
+
+function daysFor(p) {
+  return dayMap(state.sessions, state.logs, p.id, tzFor(p));
+}
+
+function streakFor(p) {
+  return streaks(daysFor(p), localDate(new Date(), tzFor(p)));
+}
+
+function setBarHeight(h) {
+  if (IN_APP) invoke("set_bar_height", { height: h }).catch(() => {});
+}
+
+function calState() {
+  if (!state.cal) {
+    const now = new Date();
+    state.cal = { mode: "month", year: now.getFullYear(), month: now.getMonth(), selected: localDate() };
+  }
+  return state.cal;
+}
+
+function orderedPeople() {
+  // You first, then everyone else.
+  return [...state.profiles].sort((a, b) => (b.id === state.user.id) - (a.id === state.user.id));
+}
+
+function calView() {
+  const c = calState();
+  const people = orderedPeople();
+  const streakChips = people
+    .map((p) => {
+      const s = streakFor(p);
+      return `<span class="chip" title="Best streak: ${s.best} days"><span class="dot" style="background:${personColor(p)}"></span>${esc(p.name.split(" ")[0])} <b>🔥 ${s.current}</b><span class="hint">best ${s.best}</span></span>`;
+    })
+    .join("");
+  const label = c.mode === "month" ? `${new Date(c.year, c.month, 1).toLocaleString("en-GB", { month: "long" })} ${c.year}` : String(c.year);
+
+  return `
+    <div class="cal">
+      <div class="cal-head">
+        <div class="seg glass">
+          <button class="${c.mode === "month" ? "on" : ""}" data-cal-mode="month">Month</button>
+          <button class="${c.mode === "year" ? "on" : ""}" data-cal-mode="year">Year</button>
+        </div>
+        <button class="arrow" data-cal-nav="-1" aria-label="Previous">‹</button>
+        <div class="cal-label">${esc(label)}</div>
+        <button class="arrow" data-cal-nav="1" aria-label="Next">›</button>
+        <div class="chips cal-streaks">${streakChips}</div>
+      </div>
+      <div class="cal-body">${c.mode === "month" ? monthView(c, people) : yearView(c, people)}</div>
+    </div>`;
+}
+
+function monthView(c, people) {
+  const maps = people.map((p) => ({ p, days: daysFor(p) }));
+  const weeks = monthGrid(c.year, c.month);
+  const keys = weeks.flat().filter(Boolean);
+  const maxFlow = Math.max(3600, ...maps.flatMap(({ days }) => keys.map((k) => days.get(k)?.flowSec || 0)));
+  const today = localDate();
+
+  const cells = weeks
+    .map((week) =>
+      week
+        .map((k) => {
+          if (!k) return `<div class="day blank"></div>`;
+          const future = k > today;
+          const bars = maps
+            .map(({ p, days }) => {
+              const d = days.get(k);
+              const active = isActive(d);
+              const w = d?.flowSec ? Math.max(8, Math.round((d.flowSec / maxFlow) * 100)) : active ? 4 : 0;
+              return `<div class="dbar" title="${esc(p.name.split(" ")[0])}: ${d?.flowSec ? hm(d.flowSec) : active ? "checked in" : "nothing"}"><i style="width:${w}%;background:${personColor(p)}"></i></div>`;
+            })
+            .join("");
+          const top = maps
+            .map(({ p, days }) => ({ p, f: days.get(k)?.flowSec || 0 }))
+            .sort((a, b) => b.f - a.f);
+          const crown = top[0]?.f > 0 && (!top[1] || top[0].f > top[1].f) ? `<span class="dcrown" style="color:${personColor(top[0].p, 70)}">●</span>` : "";
+          return `
+            <button class="day ${k === today ? "today" : ""} ${k === c.selected ? "sel" : ""} ${future ? "future" : ""}" data-day="${k}">
+              <span class="dnum">${Number(k.slice(8))}</span>${crown}
+              <div class="dbars">${bars}</div>
+            </button>`;
+        })
+        .join("")
+    )
+    .join("");
+
+  return `
+    <div class="tile glass month">
+      <div class="wk">${WEEKDAYS.map((d) => `<span>${d}</span>`).join("")}</div>
+      <div class="grid" style="grid-template-rows:repeat(${weeks.length},1fr)">${cells}</div>
+    </div>
+    ${dayDetail(c, maps)}`;
+}
+
+function dayDetail(c, maps) {
+  const k = c.selected;
+  const [y, m, d] = k.split("-").map(Number);
+  const label = new Date(y, m - 1, d).toLocaleDateString("en-GB", { weekday: "long", day: "numeric", month: "long" });
+  const rows = maps
+    .map(({ p, days }) => {
+      const day = days.get(k);
+      const late = day?.lastEndMs && hourOf(day.lastEndMs, tzFor(p)) < 5 && day.lastEndMs > Date.parse(`${k}T00:00:00Z`) ? ` · till ${clockLabel(day.lastEndMs, tzFor(p))}` : "";
+      return `
+        <div class="dd-person">
+          <div class="dd-head">${avatar(p, { size: "sm" })}<b>${esc(p.name.split(" ")[0])}</b>
+            <span class="hint">${day?.flowSec ? `${hm(day.flowSec)} flow${late}` : isActive(day) ? "Checked in" : "No activity"}</span></div>
+          ${day && isActive(day) ? `
+            <div class="chips" style="margin-top:6px">
+              <span class="chip">Sessions <b>${day.sessions}</b></span>
+              <span class="chip">Longest <b>${day.longestSec ? hm(day.longestSec) : "0m"}</b></span>
+              <span class="chip">Wins <b>${day.wins}</b></span>
+            </div>
+            ${day.focus ? `<div class="clamp" style="margin-top:6px"><span class="label">Focus</span> ${esc(day.focus)}</div>` : ""}
+            ${day.notes ? `<div class="clamp" style="margin-top:4px"><span class="label">Done</span> ${esc(day.notes)}</div>` : ""}` : ""}
+        </div>`;
+    })
+    .join("");
+  return `
+    <div class="tile glass dd">
+      <div class="label">${esc(label)}</div>
+      ${rows}
+    </div>`;
+}
+
+function rangeOfMonth(y, m) {
+  const start = new Date(y, m, 1);
+  const end = new Date(y, m + 1, 1);
+  return { start, end, label: start.toLocaleString("en-GB", { month: "long", year: "numeric" }) };
+}
+
+function scoredFor(range) {
+  return state.profiles.map((p) => ({ ...scoreFor(p.id, range), name: p.name, p }));
+}
+
+function yearSummary(year) {
+  const now = new Date();
+  const months = [];
+  for (let m = 0; m < 12; m++) {
+    const range = rangeOfMonth(year, m);
+    const status = range.end <= now ? "done" : range.start <= now ? "live" : "future";
+    const rows = scoredFor(range);
+    months.push({ m, range, status, rows, result: winnerOf(rows) });
+  }
+  const yearRange = { start: new Date(year, 0, 1), end: new Date(year + 1, 0, 1) };
+  const totals = scoredFor(yearRange).map((r) => ({
+    ...r,
+    crowns: months.filter((x) => x.status === "done" && x.result.kind === "winner" && x.result.winner.userId === r.userId).length,
+  }));
+  const yearDone = yearRange.end <= now;
+  return { months, totals, result: winnerOf(totals), yearDone };
+}
+
+function yearView(c, people) {
+  const ys = yearSummary(c.year);
+  const maxPts = Math.max(1, ...ys.months.flatMap((x) => x.rows.map((r) => r.points)));
+
+  const tiles = ys.months
+    .map(({ m, status, rows, result }) => {
+      let body;
+      if (status === "future") body = `<div class="hint">Upcoming</div>`;
+      else if (result.kind === "winner") {
+        const w = result.winner;
+        body = `<div class="mwin">${avatar(w.p, { size: "sm" })}<b>${esc(w.name.split(" ")[0])}</b>${status === "done" ? `<span class="crown">👑</span>` : ""}</div>${status === "live" ? `<div class="hint">Leading · ${w.points} pts</div>` : `<div class="hint">${w.points} pts</div>`}`;
+      } else if (result.kind === "tie") body = `<div class="mwin"><b>Tie</b></div>`;
+      else body = `<div class="hint">${status === "live" ? "Nothing yet" : "No data"}</div>`;
+      const bars = people
+        .map((p) => {
+          const r = rows.find((x) => x.userId === p.id);
+          return `<div class="dbar"><i style="width:${Math.round(((r?.points || 0) / maxPts) * 100)}%;background:${personColor(p)}"></i></div>`;
+        })
+        .join("");
+      return `
+        <button class="mtile glass ${status}" data-month="${m}">
+          <div class="mname">${MONTHS_SHORT[m]}${status === "live" ? ` <span class="live">live</span>` : ""}</div>
+          ${body}
+          <div class="dbars">${bars}</div>
+        </button>`;
+    })
+    .join("");
+
+  const maxTotal = Math.max(1, ...ys.totals.map((t) => t.points));
+  const race = [...ys.totals]
+    .sort((a, b) => b.points - a.points)
+    .map(
+      (t, i) => `
+      <div class="rank ${i === 0 && ys.result.kind === "winner" ? "lead" : ""}">
+        ${avatar(t.p, { size: "sm" })}
+        <div class="who"><b>${esc(t.name.split(" ")[0])}</b><small>${t.crowns} ${t.crowns === 1 ? "crown" : "crowns"} · ${hm(t.flowSec)} flow</small>
+          <div class="bar"><i style="width:${Math.round((t.points / maxTotal) * 100)}%"></i></div></div>
+        <span class="pts">${t.points}</span>
+      </div>`
+    )
+    .join("");
+
+  let hero;
+  if (ys.yearDone && ys.result.kind === "winner") {
+    const w = ys.result.winner;
+    hero = `<div class="eoy">${avatar(w.p, { size: "lg" })}<div><div class="crown-big">👑 Employee of the Year</div><div class="big">${esc(w.name)}</div></div></div>`;
+  } else if (ys.yearDone) {
+    hero = `<div class="eoy"><div><div class="crown-big">👑 ${c.year}</div><div class="big">${ys.result.kind === "tie" ? "Dead heat" : "No data"}</div></div></div>`;
+  } else {
+    hero = `<div class="eoy"><div><div class="crown-big">👑 Race for ${c.year}</div><div class="small">Most points across the year. Crowned 1 January.</div></div></div>`;
+  }
+
+  return `
+    <div class="months">${tiles}</div>
+    <div class="tile glass yr">
+      ${hero}
+      ${race}
+    </div>`;
+}
+
+function wireCal(el) {
+  el.querySelectorAll("[data-cal-mode]").forEach((b) =>
+    b.addEventListener("click", () => {
+      calState().mode = b.dataset.calMode;
+      renderBody();
+    })
+  );
+  el.querySelectorAll("[data-cal-nav]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const c = calState();
+      const step = Number(b.dataset.calNav);
+      if (c.mode === "year") c.year += step;
+      else {
+        const d = new Date(c.year, c.month + step, 1);
+        c.year = d.getFullYear();
+        c.month = d.getMonth();
+      }
+      renderBody();
+    })
+  );
+  el.querySelectorAll("[data-day]").forEach((b) =>
+    b.addEventListener("click", () => {
+      calState().selected = b.dataset.day;
+      renderBody();
+    })
+  );
+  el.querySelectorAll("[data-month]").forEach((b) =>
+    b.addEventListener("click", () => {
+      const c = calState();
+      c.mode = "month";
+      c.month = Number(b.dataset.month);
+      const firstOfMonth = `${c.year}-${String(c.month + 1).padStart(2, "0")}-01`;
+      c.selected = localDate().startsWith(firstOfMonth.slice(0, 7)) ? localDate() : firstOfMonth;
+      renderBody();
+    })
+  );
+}
+
+function applyBarHeight() {
+  const tall = state.tab === "cal";
+  document.documentElement.classList.toggle("tall", tall);
+  setBarHeight(tall ? CAL_HEIGHT : BAR_HEIGHT_PX);
+}
+
 /* ---------- screens ---------- */
 
 function renderAuth(mode = "in", msg = "") {
   stopLoops();
+  document.documentElement.classList.remove("tall");
+  setBarHeight(BAR_HEIGHT_PX);
   const err = msg.startsWith("!");
   app.innerHTML = `
     ${brandColumn()}
@@ -731,6 +1065,8 @@ function renderAuth(mode = "in", msg = "") {
 }
 
 function renderCheckin() {
+  document.documentElement.classList.remove("tall");
+  setBarHeight(BAR_HEIGHT_PX);
   const first = (state.me?.name || "").split(" ")[0];
   const hour = new Date().getHours();
   const greet = hour < 12 ? "Morning" : hour < 18 ? "Afternoon" : "Evening";
@@ -844,7 +1180,7 @@ function startLoops() {
   state.timers.push(setInterval(async () => {
     await Promise.all([loadProfiles(), loadActivity()]);
     renderBody();
-  }, 5 * 60 * 1000));
+  }, 30 * 60 * 1000));
 }
 
 /* ---------- boot ---------- */
@@ -873,6 +1209,7 @@ async function doEnter(user) {
     return;
   }
   maybeCrown();
+  maybeCrownYear();
   // Pick up the cutoff check straight away if the app was closed mid-session.
   secondTick();
   joinPresence();
@@ -880,6 +1217,22 @@ async function doEnter(user) {
   pollMusic();
   if (state.today?.focus) renderShell();
   else renderCheckin();
+}
+
+/** After anything you log: fireworks if today just pushed your streak to a milestone. */
+function checkStreak() {
+  if (!state.me) return;
+  const st = streakFor(state.me);
+  if (!st.activeToday || !STREAK_MILESTONES.includes(st.current)) return;
+  const key = "lshq.streakCheer";
+  const mark = `${st.current}:${localDate()}`;
+  try {
+    if (localStorage.getItem(key) === mark) return;
+    localStorage.setItem(key, mark);
+  } catch {
+    return;
+  }
+  setTimeout(() => celebrate(streakCheer({ days: st.current, best: st.best })), 400);
 }
 
 /** First open of a new month: crown last month's Employee of the Month, once. */
@@ -895,6 +1248,22 @@ function maybeCrown() {
     return;
   }
   setTimeout(() => celebrate(crownCheer({ winner, monthLabel: label, isMe: winner.userId === state.user.id })), 1500);
+}
+
+/** First open of a new year: crown last year's Employee of the Year, once. */
+function maybeCrownYear() {
+  const year = new Date().getFullYear() - 1;
+  const ys = yearSummary(year);
+  if (ys.result.kind !== "winner") return;
+  const key = "lshq.crownedYear";
+  try {
+    if (localStorage.getItem(key) === String(year)) return;
+    localStorage.setItem(key, String(year));
+  } catch {
+    return;
+  }
+  const w = ys.result.winner;
+  setTimeout(() => celebrate(yearCrownCheer({ winner: w, year, isMe: w.userId === state.user.id })), 2500);
 }
 
 async function signOut() {

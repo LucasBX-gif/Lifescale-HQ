@@ -188,3 +188,41 @@ export function crownCheer({ winner, monthLabel, isMe }) {
     duration: 7000,
   };
 }
+
+/** You hit a streak milestone. */
+export function streakCheer({ days, best }) {
+  const lines = {
+    3: "Three days running. It's a habit now.",
+    7: "A full week. No days off.",
+    14: "Two weeks straight.",
+    30: "A whole month without missing a day.",
+    50: "Fifty days. Built different.",
+    75: "Seventy five days in a row.",
+    100: "One hundred days. Legendary.",
+  };
+  return {
+    kind: "streak",
+    icon: "🔥",
+    title: `${days} day streak.`,
+    subtitle: lines[days] || `${days} days in a row.`,
+    badge: days >= best && days > 3 ? "New best streak" : null,
+    chips: [`Best ${Math.max(best, days)} days`],
+    intensity: days >= 30 ? 3 : 2,
+    palette: "warm",
+  };
+}
+
+/** 1 January: Employee of the Year. */
+export function yearCrownCheer({ winner, year, isMe }) {
+  return {
+    kind: "crown",
+    icon: "👑",
+    title: isMe ? `You're Employee of the Year.` : `${first(winner.name)} is Employee of the Year.`,
+    subtitle: `${year} · ${pts(winner.points)} · ${winner.crowns} monthly ${winner.crowns === 1 ? "crown" : "crowns"}.`,
+    badge: `Employee of ${year}`,
+    chips: [`${duration(winner.flowSec)} flow`, `${winner.wins} ${winner.wins === 1 ? "win" : "wins"}`],
+    intensity: 3,
+    palette: "gold",
+    duration: 8000,
+  };
+}

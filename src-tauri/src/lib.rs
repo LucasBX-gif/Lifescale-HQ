@@ -1,6 +1,6 @@
 use serde::Serialize;
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{
     image::Image,
@@ -11,7 +11,11 @@ use tauri::{
 
 /// The bar is wide and short and sits just under the menu bar.
 const BAR_MAX_WIDTH: f64 = 920.0;
-const BAR_HEIGHT: f64 = 156.0;
+const BAR_HEIGHT: u32 = 156;
+const BAR_MAX_TALL: u32 = 560;
+
+/// The bar grows taller for the calendar, then shrinks back.
+static BAR_H: AtomicU32 = AtomicU32::new(BAR_HEIGHT);
 const BELOW_MENU_BAR: f64 = 42.0;
 
 #[derive(Serialize)]
@@ -198,6 +202,16 @@ fn celebrate(app: tauri::AppHandle, payload: serde_json::Value) {
     let _ = app.emit_to("fx", "celebrate", payload);
 }
 
+/// Resize the bar (taller for the calendar), keeping it centred under the menu bar.
+#[tauri::command]
+fn set_bar_height(app: tauri::AppHandle, height: u32) {
+    let h = height.clamp(BAR_HEIGHT, BAR_MAX_TALL);
+    BAR_H.store(h, Ordering::Relaxed);
+    if let Some(window) = app.get_webview_window("main") {
+        place_bar(&window);
+    }
+}
+
 /// The overlay finished playing.
 #[tauri::command]
 fn fx_done(app: tauri::AppHandle) {
@@ -221,7 +235,8 @@ fn place_bar(window: &WebviewWindow) {
     let size = monitor.size().to_logical::<f64>(scale);
     let pos = monitor.position().to_logical::<f64>(scale);
     let width = BAR_MAX_WIDTH.min(size.width - 40.0);
-    let _ = window.set_size(LogicalSize::new(width, BAR_HEIGHT));
+    let height = BAR_H.load(Ordering::Relaxed) as f64;
+    let _ = window.set_size(LogicalSize::new(width, height));
     let _ = window.set_position(LogicalPosition::new(
         pos.x + (size.width - width) / 2.0,
         pos.y + BELOW_MENU_BAR,
@@ -267,7 +282,7 @@ pub fn run() {
     builder
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
-        .invoke_handler(tauri::generate_handler![now_playing, idle_seconds, celebrate, fx_done])
+        .invoke_handler(tauri::generate_handler![now_playing, idle_seconds, celebrate, fx_done, set_bar_height])
         .setup(|app| {
             // Menu bar only: no Dock icon.
             #[cfg(target_os = "macos")]

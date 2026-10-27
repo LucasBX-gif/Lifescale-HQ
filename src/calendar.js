@@ -94,3 +94,33 @@ export function winnerOf(rows) {
   if (sorted[1] && sorted[1].points === sorted[0].points) return { kind: "tie", rows: sorted };
   return { kind: "winner", winner: sorted[0], rows: sorted };
 }
+
+/**
+ * Seconds two people were both in flow at the same time, counting only time inside [fromMs, toMs).
+ * Each list is [{ s: startMs, e: endMs }]. Works on any order; overlapping sessions of one person are merged.
+ */
+export function overlapSeconds(a, b, fromMs = -Infinity, toMs = Infinity) {
+  const norm = (list) => {
+    const xs = list
+      .map((x) => ({ s: Math.max(x.s, fromMs), e: Math.min(x.e, toMs) }))
+      .filter((x) => x.e > x.s)
+      .sort((p, q) => p.s - q.s);
+    const out = [];
+    for (const x of xs) {
+      const last = out[out.length - 1];
+      if (last && x.s <= last.e) last.e = Math.max(last.e, x.e);
+      else out.push({ ...x });
+    }
+    return out;
+  };
+  const A = norm(a), B = norm(b);
+  let i = 0, j = 0, ms = 0;
+  while (i < A.length && j < B.length) {
+    const s = Math.max(A[i].s, B[j].s);
+    const e = Math.min(A[i].e, B[j].e);
+    if (e > s) ms += e - s;
+    if (A[i].e < B[j].e) i++;
+    else j++;
+  }
+  return Math.round(ms / 1000);
+}

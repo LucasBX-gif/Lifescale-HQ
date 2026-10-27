@@ -15,3 +15,6 @@ export const IDLE_CUTOFF_MINUTES = 10;
 export const CHEER_MIN_FLOW_MINUTES = 20;
 // Shortest partner session that pops up on your screen.
 export const CHEER_MIN_PARTNER_FLOW_MINUTES = 30;
+
+// Bonus for every minute you're both in flow at the same time (on top of the normal flow point).
+export const POINTS_PER_TOGETHER_MINUTE = 0.5;

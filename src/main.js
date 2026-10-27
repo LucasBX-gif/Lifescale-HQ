@@ -1,6 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { check } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 import {
@@ -12,8 +13,9 @@ import {
   IDLE_CUTOFF_MINUTES,
   CHEER_MIN_FLOW_MINUTES,
   CHEER_MIN_PARTNER_FLOW_MINUTES,
+  POINTS_PER_TOGETHER_MINUTE,
 } from "./config.js";
-import { dayMap, streaks, isActive, monthGrid, winnerOf, STREAK_MILESTONES } from "./calendar.js";
+import { dayMap, streaks, isActive, monthGrid, winnerOf, STREAK_MILESTONES, overlapSeconds } from "./calendar.js";
 import { clockLabel, hourOf } from "./cheers.js";
 import { myFlowCheer, myWinCheer, myDayCheer, partnerFlowCheer, partnerWinCheer, crownCheer, streakCheer, yearCrownCheer } from "./cheers.js";
 
@@ -52,6 +54,14 @@ const state = {
   layout: "bar",
   screen: "auth",
   pinned: false,
+  invite: null,
+  goal: null,
+  goalError: null,
+  editingGoal: false,
+  eodPending: false,
+  activeSince: null,
+  autoSnoozeUntil: 0,
+  autostart: false,
   banner: null,
   date: localDate(),
   channel: null,
@@ -307,6 +317,17 @@ function joinPresence() {
     }
   });
   ch.on("broadcast", { event: "poke" }, ({ payload }) => onPoke(payload));
+  ch.on("postgres_changes", { event: "*", schema: "public", table: "team_goals" }, (change) => {
+    const row = change.new;
+    if (!row || row.period !== goalPeriod()) return;
+    const before = state.goal?.progress || 0;
+    state.goal = row;
+    renderBody();
+    if (row.updated_by && row.updated_by !== state.user.id && (row.progress || 0) > before) {
+      const who = state.profiles.find((p) => p.id === row.updated_by);
+      celebrate(goalCheer(row, before, who?.name, false));
+    }
+  });
   ch.subscribe((status) => {
     if (status === "SUBSCRIBED") track();
   });
@@ -319,8 +340,8 @@ function flowElapsed() {
   return state.flow ? (Date.now() - state.flow.startedAt) / 1000 : 0;
 }
 
-function startFlow() {
-  state.flow = { startedAt: Date.now(), task: state.today?.focus || null };
+function startFlow({ startedAt = Date.now(), auto = false } = {}) {
+  state.flow = { startedAt, auto, task: state.today?.focus || null };
   saveFlow();
   track();
   renderBody();
@@ -374,6 +395,13 @@ async function stopFlow(endAt = Date.now(), reason = null, { idle = false, quiet
         flowTodaySec: flowTodayFor(state.user.id, MY_TZ),
         longestBeforeSec,
         idle,
+        ...(() => {
+          const partner = partnerOf();
+          if (!partner) return {};
+          const live = partnerFlowStart();
+          const theirs = spansFor(partner.id).concat(live ? [{ s: live, e: endAt }] : []);
+          return { togetherSec: overlapSeconds([{ s: flow.startedAt, e: endAt }], theirs), partnerName: partner.name };
+        })(),
       })
     );
   }
@@ -397,8 +425,13 @@ function scoreFor(userId, range) {
   const wins = logs.reduce((a, l) => a + (l.wins || 0), 0);
   const fullDays = logs.filter((l) => l.focus && l.notes && l.notes.trim()).length;
   const flowMin = Math.floor(flowSec / 60);
-  const points = flowMin * POINTS_PER_FLOW_MINUTE + wins * POINTS_PER_WIN + fullDays * POINTS_PER_FULL_DAY;
-  return { userId, flowSec, flowMin, wins, fullDays, points };
+  const togetherSec = togetherSecFor(userId, startMs, endMs);
+  const points =
+    flowMin * POINTS_PER_FLOW_MINUTE +
+    wins * POINTS_PER_WIN +
+    fullDays * POINTS_PER_FULL_DAY +
+    Math.floor((togetherSec / 60) * POINTS_PER_TOGETHER_MINUTE);
+  return { userId, flowSec, flowMin, wins, fullDays, togetherSec, points };
 }
 
 function standings(offset = 0) {
@@ -472,8 +505,8 @@ function ringOffset(seconds) {
 
 function brandColumn() {
   return `
-    <div class="brand">
-      <div class="orb" title="Lifescale HQ"></div>
+    <div class="brand" data-drag>
+      <div class="orb" title="Drag to move · double-click to snap back to the top" id="orb"></div>
       ${state.user ? `<button class="pin ${state.pinned ? "on" : ""}" id="pinbtn" title="Mini widget: keep a small bar on screen you can drag anywhere">${ICON_PIN}</button>` : ""}
       <div id="updateslot">${state.updateReady ? `<button class="update" id="doupdate" title="Version ${esc(state.updateReady)} is ready">Update</button>` : `<small>HQ</small>`}</div>
     </div>`;
@@ -481,6 +514,7 @@ function brandColumn() {
 
 function wireBrand() {
   app.querySelector("#doupdate")?.addEventListener("click", restartForUpdate);
+  app.querySelector("#orb")?.addEventListener("dblclick", resetBarPos);
   app.querySelector("#pinbtn")?.addEventListener("click", togglePinned);
 }
 
@@ -488,7 +522,8 @@ function renderShell() {
   state.screen = "shell";
   if (state.layout === "mini") return renderMini();
   app.classList.remove("is-mini");
-  app.removeAttribute("data-tauri-drag-region");
+  app.setAttribute("data-drag", "");
+  app.removeAttribute("data-drag");
   app.innerHTML = `
     ${brandColumn()}
     <div class="content" id="body"></div>
@@ -557,12 +592,13 @@ function personTile(p) {
   const status = flowStart ? "flow" : online ? "on" : ps.kind === "away" ? "away" : "";
 
   const sub = flowStart
-    ? `<div class="p-sub flow" data-flow-since="${flowStart}">In flow</div>`
+    ? `<div class="p-sub flow" data-flow-since="${flowStart}" data-prefix="${state.flow ? "🔗 With you" : "In flow"}">In flow</div>`
     : `<div class="p-sub">${online ? "Online now" : ps.kind === "away" ? `Away · active ${esc(agoShort(ps.lastMs))}` : ps.lastMs ? esc(ago(new Date(ps.lastMs).toISOString())) : "Offline"}</div>`;
 
   return `
     <div class="tile glass grow person-tile">
       <div class="react">
+        <button data-lock title="Lock in together (L)" class="lockbtn">🔗</button>
         <button data-poke="nudge" title="Nudge ${esc(p.name.split(" ")[0])}">👊</button>
         <button data-poke="fire" title="Send fire">🔥</button>
         <button data-poke="call" title="Ask for a quick call">📞</button>
@@ -578,7 +614,7 @@ function personTile(p) {
       <div class="chips">
         ${np ? `<span class="chip music" title="${esc(np.track)} · ${esc(np.artist)}"><span class="eq"><i></i><i></i><i></i></span><span class="txt"><b>${esc(np.track)}</b> · ${esc(np.artist)}</span></span>` : ""}
         ${(() => { const st = streakFor(p); return st.current ? `<span class="chip" title="${st.current} day streak">🔥 <b>${st.current}</b></span>` : ""; })()}
-        <span class="chip"><b>${esc(timeIn(tz))}</b>${offset ? esc(offset) : ""}</span>
+        <span class="chip" title="${offset ? `Their time (${esc(offset)})` : "Local time"}"><b>${esc(timeIn(tz))}</b></span>
         <span class="chip" title="Flow today">⏱ <b>${hm(flowTodayFor(p.id, tz))}</b></span>
         ${np ? "" : `<span class="chip" title="Wins today">🏆 <b>${log?.wins || 0}</b></span>`}
       </div>
@@ -612,7 +648,7 @@ function meTile() {
         </div>
       </div>
       <div class="me-col">
-        <div class="label">You${running ? " · in flow" : ""}</div>
+        <div class="label">You${running ? (togetherSince() ? ` · 🔗 with ${esc(partnerOf()?.name.split(" ")[0] || "")}` : state.flow.auto ? " · auto-flow" : " · in flow") : ""}</div>
         ${focus ? `<div class="clamp" style="margin-top:4px">${esc(focus)}</div>` : `<div class="clamp empty" style="margin-top:4px">No focus set. Add one in Log.</div>`}
         ${np ? `<div class="chips" style="margin-top:6px"><span class="chip music"><span class="eq"><i></i><i></i><i></i></span><span class="txt"><b>${esc(np.track)}</b></span></span></div>` : ""}
         <div class="me-foot">
@@ -639,7 +675,7 @@ function scoreTile() {
     .join("");
   return `
     <div class="tile glass score">
-      <div class="label">${esc(monthRange(0).label.split(" ")[0])} points</div>
+      ${state.goal ? goalMini() : `<div class="label" title="${POINTS_PER_FLOW_MINUTE} per flow minute · ${POINTS_PER_WIN} per win · ${POINTS_PER_FULL_DAY} per full day · +${POINTS_PER_TOGETHER_MINUTE} per minute in flow together">${esc(monthRange(0).label.split(" ")[0])} points</div>`}
       ${rows}
       <div class="wins">
         <span class="label">Wins today</span>
@@ -657,7 +693,8 @@ function nowView() {
   const partners = others.length
     ? others.map(personTile).join("")
     : `<div class="tile glass grow"><div class="empty">Waiting for Seva to sign up</div></div>`;
-  return partners + meTile() + scoreTile();
+  // An invite takes over Seva's card until you join or dismiss it.
+  return (inviteActive() ? inviteTile() : partners) + meTile() + scoreTile();
 }
 
 function logView() {
@@ -674,6 +711,11 @@ function logView() {
     <div class="tile glass actions">
       <button class="pill primary" id="savelog">Save</button>
       <div class="saved" id="logsaved">Saved</div>
+      <div class="setting">
+        <span class="label">Auto-flow</span>
+        <div class="seg mini-seg">${["auto", "ask", "off"].map((m) => `<button class="${autoMode() === m ? "on" : ""}" data-auto="${m}">${m[0].toUpperCase() + m.slice(1)}</button>`).join("")}</div>
+      </div>
+      <button class="setting toggle ${state.autostart ? "on" : ""}" id="autostart"><span class="label">Open at login</span><i></i></button>
       <button class="link" id="signout">Sign out</button>
     </div>`;
 }
@@ -711,7 +753,7 @@ function boardView() {
       <div class="rank ${i === 0 && r.points > 0 && !tie ? "lead" : ""}">
         ${avatar({ id: r.userId, name: r.name }, { size: "sm" })}
         <div class="who">
-          <b>${esc(r.name)}</b><small>${hm(r.flowSec)} flow · ${r.wins} ${r.wins === 1 ? "win" : "wins"} · ${r.fullDays} full ${r.fullDays === 1 ? "day" : "days"}</small>
+          <b>${esc(r.name)}</b><small>${hm(r.flowSec)} flow · ${r.wins} ${r.wins === 1 ? "win" : "wins"} · ${r.fullDays} full ${r.fullDays === 1 ? "day" : "days"}${r.togetherSec >= 60 ? ` · 🔗 ${hm(r.togetherSec)}` : ""}</small>
           <div class="bar"><i style="width:${Math.round((r.points / max) * 100)}%;background:${personColor({ id: r.userId })}"></i></div>
         </div>
         <span class="pts">${r.points}</span>
@@ -725,12 +767,7 @@ function boardView() {
       <div class="label">${esc(range.label)}</div>
       ${rows || `<div class="empty">Nothing logged yet.</div>`}
     </div>
-    <div class="tile glass rules">
-      <div class="label" style="margin-bottom:2px">Points</div>
-      <div><span>Flow minute</span><b>${POINTS_PER_FLOW_MINUTE}</b></div>
-      <div><span>Win</span><b>${POINTS_PER_WIN}</b></div>
-      <div><span>Full day</span><b>${POINTS_PER_FULL_DAY}</b></div>
-    </div>`;
+    ${goalTile()}`;
 }
 
 function flash(id) {
@@ -742,6 +779,8 @@ function flash(id) {
 
 function wireBody(el) {
   wireCal(el);
+  wireGoal(el);
+  el.querySelectorAll("[data-lock]").forEach((b) => b.addEventListener("click", sendLockIn));
   el.querySelector("#signout")?.addEventListener("click", signOut);
   el.querySelector("#flowbtn")?.addEventListener("click", toggleFlow);
   el.querySelectorAll("[data-poke]").forEach((b) => b.addEventListener("click", () => sendPoke(b.dataset.poke)));
@@ -776,15 +815,438 @@ function tick() {
   }
   document.querySelectorAll("[data-flow-since]").forEach((n) => {
     const since = Number(n.dataset.flowSince);
-    n.textContent = `In flow · ${clock((Date.now() - since) / 1000)}`;
+    n.textContent = `${n.dataset.prefix || "In flow"} · ${clock((Date.now() - since) / 1000)}`;
   });
 }
+
+/* ---------- together time (both in flow at once) ---------- */
+
+let spanCache = { ref: null, byUser: new Map() };
+function spansFor(userId) {
+  if (spanCache.ref !== state.sessions) spanCache = { ref: state.sessions, byUser: new Map() };
+  if (!spanCache.byUser.has(userId)) {
+    spanCache.byUser.set(
+      userId,
+      state.sessions.filter((x) => x.user_id === userId).map((x) => ({ s: Date.parse(x.started_at), e: Date.parse(x.ended_at) }))
+    );
+  }
+  return spanCache.byUser.get(userId);
+}
+
+function togetherSecFor(userId, fromMs, toMs) {
+  return state.profiles
+    .filter((p) => p.id !== userId)
+    .reduce((sum, p) => sum + overlapSeconds(spansFor(userId), spansFor(p.id), fromMs, toMs), 0);
+}
+
+function partnerOf() {
+  return state.profiles.find((p) => p.id !== state.user?.id) || null;
+}
+
+/** Partner's live flow start, if they're in flow right now. */
+function partnerFlowStart() {
+  const p = partnerOf();
+  if (!p || presenceStatus(p).kind === "offline") return null;
+  return state.presence[p.id]?.flow_started_at || null;
+}
+
+/** Both in flow right now: when the together part started. */
+function togetherSince() {
+  const theirs = partnerFlowStart();
+  if (!state.flow || !theirs) return null;
+  return Math.max(state.flow.startedAt, theirs);
+}
+
+/* ---------- settings ---------- */
+
+const AUTO_KEY = "lshq.autoflow"; // "auto" | "ask" | "off"
+function autoMode() {
+  try {
+    return localStorage.getItem(AUTO_KEY) || "auto";
+  } catch {
+    return "auto";
+  }
+}
+function setAutoMode(m) {
+  try {
+    localStorage.setItem(AUTO_KEY, m);
+  } catch {}
+}
+
+async function initAutostart() {
+  if (!IN_APP) return;
+  try {
+    if (!localStorage.getItem("lshq.autostartInit")) {
+      state.autostart = await invoke("set_autostart", { enabled: true });
+      localStorage.setItem("lshq.autostartInit", "1");
+    } else {
+      state.autostart = await invoke("set_autostart", { enabled: null });
+    }
+  } catch {}
+}
+
+async function toggleAutostart() {
+  if (!IN_APP) return;
+  try {
+    state.autostart = await invoke("set_autostart", { enabled: !state.autostart });
+  } catch {}
+  renderBody();
+}
+
+function once(key, value) {
+  try {
+    if (localStorage.getItem(key) === value) return false;
+    localStorage.setItem(key, value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* ---------- auto-flow ---------- */
+
+const AUTO_AFTER_MS = 10 * 60 * 1000; // continuous activity before the timer starts itself
+const ACTIVITY_GAP_MS = 3 * 60 * 1000; // a pause longer than this resets the activity run
+
+function trackActivity(idleSec) {
+  const now = Date.now();
+  if (idleSec * 1000 >= ACTIVITY_GAP_MS) {
+    state.activeSince = null;
+    return;
+  }
+  if (!state.activeSince) state.activeSince = now - idleSec * 1000;
+  if (state.flow || !state.user || state.screen === "auth") return;
+  const mode = autoMode();
+  if (mode === "off") return;
+  if (state.autoSnoozeUntil && now < state.autoSnoozeUntil) return;
+  if (now - state.activeSince < AUTO_AFTER_MS) return;
+
+  if (mode === "auto") {
+    startFlow({ startedAt: state.activeSince, auto: true });
+    celebrate({
+      kind: "poke",
+      icon: "⚡",
+      title: "Auto-flow on.",
+      subtitle: `You've been locked in for ${Math.round((now - state.activeSince) / 60000)} min, so it's counting.`,
+      chips: [],
+      intensity: 0,
+      duration: 3200,
+    });
+  } else if (once("lshq.askFlow", String(Math.floor(now / (30 * 60 * 1000))))) {
+    celebrate({ kind: "poke", icon: "⚡", title: "Locked in?", subtitle: "Press ⌥⇧Space then Space to track it.", chips: [], intensity: 0, duration: 3500 });
+  }
+}
+
+/* ---------- lock in together ---------- */
+
+const INVITE_TTL_MS = 10 * 60 * 1000;
+
+function sendLockIn() {
+  const partner = partnerOf();
+  if (!partner) return;
+  if (!state.flow) startFlow();
+  sendPoke("lockin");
+  setBanner(`Invite sent. Waiting for ${partner.name.split(" ")[0]}…`, "info", 4000);
+}
+
+function joinLockIn() {
+  state.invite = null;
+  if (!state.flow) startFlow();
+  sendPoke("joined");
+  renderBody();
+}
+
+function inviteActive() {
+  return state.invite && Date.now() - state.invite.at < INVITE_TTL_MS && !state.flow;
+}
+
+function inviteTile() {
+  if (!inviteActive()) return "";
+  const name = esc(String(state.invite.fromName || "Seva").split(" ")[0]);
+  return `
+    <div class="tile glass grow invite">
+      <div class="label">🔗 Lock in together</div>
+      <div class="inv-title">${name} is locked in. Join?</div>
+      <div class="inv-actions">
+        <button class="pill primary" id="joinlock">Join</button>
+        <button class="link" id="skiplock">Not now</button>
+      </div>
+    </div>`;
+}
+
+/** Both online, both active, neither in flow: suggest locking in (at most every 3 hours). */
+function maybeSuggestLockIn() {
+  const p = partnerOf();
+  if (!p || state.flow || partnerFlowStart()) return;
+  if (presenceStatus(p).kind !== "online" || (state.idleSec || 0) > 120) return;
+  if (!once("lshq.suggestLock", String(Math.floor(Date.now() / (3 * 3600 * 1000))))) return;
+  celebrate({
+    kind: "poke",
+    icon: "🔗",
+    title: `You and ${p.name.split(" ")[0]} are both online.`,
+    subtitle: "Lock in together? Flow at the same time scores a bonus.",
+    chips: [],
+    intensity: 0,
+    duration: 4200,
+  });
+}
+
+/* ---------- team goal ---------- */
+
+function goalPeriod() {
+  return localDate().slice(0, 7);
+}
+
+async function loadGoal() {
+  const { data, error } = await sb.from("team_goals").select("*").eq("period", goalPeriod()).maybeSingle();
+  if (error) {
+    state.goalError = /relation|does not exist|schema cache/i.test(error.message) ? "missing" : error.message;
+    state.goal = null;
+    return;
+  }
+  state.goalError = null;
+  state.goal = data || null;
+}
+
+async function saveGoal(patch) {
+  const row = {
+    period: goalPeriod(),
+    title: state.goal?.title || "Clients signed",
+    target: state.goal?.target || 5,
+    progress: state.goal?.progress || 0,
+    ...patch,
+    updated_by: state.user.id,
+    updated_at: new Date().toISOString(),
+  };
+  const { data, error } = await sb.from("team_goals").upsert(row, { onConflict: "period" }).select().single();
+  if (error) {
+    setBanner(`Couldn't save goal: ${error.message}`, "err");
+    return false;
+  }
+  state.goal = data;
+  return true;
+}
+
+async function bumpGoal(step) {
+  if (!state.goal) return;
+  const progress = Math.max(0, (state.goal.progress || 0) + step);
+  const before = state.goal.progress || 0;
+  if (!(await saveGoal({ progress }))) return;
+  renderBody();
+  if (step > 0) celebrate(goalCheer(state.goal, before, state.me?.name, true));
+}
+
+function goalCheer(goal, before, byName, isMe) {
+  const done = goal.progress >= goal.target && before < goal.target;
+  const who = isMe ? "You" : String(byName || "Seva").split(" ")[0];
+  return {
+    kind: done ? "crown" : "goal",
+    icon: done ? "🎯" : "🤝",
+    title: done ? "Team goal smashed." : `${goal.progress} / ${goal.target} ${goal.title.toLowerCase()}.`,
+    subtitle: done ? `${goal.title}: ${goal.progress} / ${goal.target}. That's the team.` : `${who} moved the team goal.`,
+    badge: done ? "Team goal" : null,
+    chips: done ? [] : [`${Math.max(0, goal.target - goal.progress)} to go`],
+    intensity: done ? 3 : 1,
+    palette: done ? "gold" : "warm",
+    duration: done ? 7000 : 4200,
+  };
+}
+
+function goalBar(goal) {
+  const pct = Math.min(100, Math.round(((goal.progress || 0) / Math.max(1, goal.target)) * 100));
+  return `<div class="bar goalbar"><i style="width:${pct}%"></i></div>`;
+}
+
+function goalMini() {
+  if (!state.goal) return "";
+  return `<div class="goalmini" title="Team goal"><span>🎯 ${esc(state.goal.title)}</span><b>${state.goal.progress}/${state.goal.target}</b></div>${goalBar(state.goal)}`;
+}
+
+function goalTile() {
+  const month = new Date().toLocaleString("en-GB", { month: "long" });
+  if (state.goalError === "missing") {
+    return `<div class="tile glass goal"><div class="label">Team goal</div><div class="hint" style="margin-top:6px">Run the team goal SQL in Supabase to switch this on.</div></div>`;
+  }
+  if (!state.goal || state.editingGoal) {
+    const g = state.goal || {};
+    return `
+      <div class="tile glass goal">
+        <div class="label">Team goal · ${esc(month)}</div>
+        <input id="goaltitle" placeholder="Clients signed" value="${esc(g.title || "")}" autocomplete="off" style="margin-top:7px">
+        <div class="goal-row" style="margin-top:6px">
+          <input id="goaltarget" type="number" min="1" placeholder="5" value="${esc(g.target || "")}" style="width:70px">
+          <button class="pill primary" id="goalsave">${state.goal ? "Save" : "Set goal"}</button>
+        </div>
+      </div>`;
+  }
+  const g = state.goal;
+  return `
+    <div class="tile glass goal">
+      <div class="label">Team goal · ${esc(month)} <button class="link" id="goaledit" style="float:right">Edit</button></div>
+      <div class="goal-title">${esc(g.title)}</div>
+      <div class="goal-row">
+        <span class="goal-num"><b>${g.progress}</b> / ${g.target}</span>
+        <div class="stepper">
+          <button id="goalminus" aria-label="Take one off">−</button>
+          <button id="goalplus" aria-label="Add one">+</button>
+        </div>
+      </div>
+      ${goalBar(g)}
+    </div>`;
+}
+
+function wireGoal(el) {
+  el.querySelector("#goalplus")?.addEventListener("click", () => bumpGoal(1));
+  el.querySelector("#goalminus")?.addEventListener("click", () => bumpGoal(-1));
+  el.querySelector("#goaledit")?.addEventListener("click", () => {
+    state.editingGoal = true;
+    renderBody();
+  });
+  el.querySelector("#goalsave")?.addEventListener("click", async () => {
+    const title = el.querySelector("#goaltitle").value.trim() || "Clients signed";
+    const target = Math.max(1, Number(el.querySelector("#goaltarget").value) || 5);
+    if (await saveGoal({ title, target })) {
+      state.editingGoal = false;
+      renderBody();
+    }
+  });
+  el.querySelector("#joinlock")?.addEventListener("click", joinLockIn);
+  el.querySelector("#skiplock")?.addEventListener("click", () => {
+    state.invite = null;
+    renderBody();
+  });
+  el.querySelectorAll("[data-auto]").forEach((b) =>
+    b.addEventListener("click", () => {
+      setAutoMode(b.dataset.auto);
+      renderBody();
+    })
+  );
+  el.querySelector("#autostart")?.addEventListener("click", toggleAutostart);
+}
+
+/* ---------- end of day ---------- */
+
+const EOD_HOUR = 21; // evening wrap-up prompt, your local time
+
+function activeTodayMe() {
+  return state.me ? streakFor(state.me).activeToday : false;
+}
+
+function checkEvening() {
+  if (!state.user || !state.me || new Date().getHours() < EOD_HOUR) return;
+  const today = localDate();
+  const st = streakFor(state.me);
+  if (!st.activeToday && st.current >= 2 && once("lshq.streakWarn", today)) {
+    celebrate({
+      kind: "poke",
+      icon: "🔥",
+      title: `Your ${st.current} day streak ends at midnight.`,
+      subtitle: "Check in or start a flow to keep it alive.",
+      chips: [],
+      intensity: 0,
+      duration: 4500,
+    });
+  }
+  if (st.activeToday && !(state.today?.notes || "").trim() && once("lshq.eodPrompt", today)) {
+    state.eodPending = true;
+    celebrate({ kind: "poke", icon: "✍️", title: "Wrap up your day.", subtitle: "One line: what did you get done? ⌥⇧Space", chips: [], intensity: 0, duration: 4200 });
+  }
+}
+
+function partnerRecapLine() {
+  const p = partnerOf();
+  if (!p) return "";
+  const tz = state.presence[p.id]?.tz || p.timezone || "UTC";
+  const today = localDate(new Date(), tz);
+  const logs = state.logs.filter((l) => l.user_id === p.id && l.notes && l.notes.trim()).sort((a, b) => (a.log_date < b.log_date ? 1 : -1));
+  const last = logs[0];
+  if (!last) return "";
+  const when = last.log_date === today ? "today" : "last time";
+  return `<div class="recap"><span class="dot" style="background:${personColor(p)}"></span><b>${esc(p.name.split(" ")[0])} ${when}:</b> ${esc(last.notes)}</div>`;
+}
+
+function renderWrap() {
+  state.screen = "wrap";
+  if (state.layout === "mini") return renderMini();
+  app.classList.remove("is-mini");
+  const first = (state.me?.name || "").split(" ")[0];
+  app.innerHTML = `
+    ${brandColumn()}
+    <div class="tile glass prompt">
+      <div class="prompt-head">
+        <h1>Wrap up${first ? `, ${esc(first)}` : ""}. <span>What did you get done today?</span></h1>
+        <button class="link" id="later">Later</button>
+      </div>
+      <div class="prompt-row">
+        <input id="notes" placeholder="Sent 30 DMs, booked 2 calls, finished Andrew's proposal…" autocomplete="off" value="${esc(state.today?.notes || "")}">
+        <button class="pill primary" id="go">Save</button>
+      </div>
+      <div class="msg">${state.today?.focus ? `This morning you said: ${esc(state.today.focus)}` : ""}</div>
+    </div>`;
+  wireBrand();
+  const input = app.querySelector("#notes");
+  setTimeout(() => input.focus(), 50);
+  const done = () => {
+    state.eodPending = false;
+    renderShell();
+  };
+  const go = async () => {
+    const v = input.value.trim();
+    if (!v) return input.focus();
+    const wasFull = !!(state.today?.focus && state.today?.notes);
+    const before = standings(0);
+    if (await saveToday({ notes: v })) {
+      done();
+      if (!wasFull && state.today?.focus) celebrate(myDayCheer({ points: POINTS_PER_FULL_DAY, before, after: standings(0), userId: state.user.id }));
+    }
+  };
+  app.querySelector("#go").addEventListener("click", go);
+  input.addEventListener("keydown", (e) => e.key === "Enter" && go());
+  app.querySelector("#later").addEventListener("click", done);
+}
+
+/* ---------- moving the bar ---------- */
+
+const BAR_POS_KEY = "lshq.barPos";
+
+function restoreBarPos() {
+  if (!IN_APP) return;
+  let pos = null;
+  try {
+    pos = JSON.parse(localStorage.getItem(BAR_POS_KEY));
+  } catch {}
+  if (Array.isArray(pos)) invoke("set_bar_position", { x: pos[0], y: pos[1] }).catch(() => {});
+}
+
+function resetBarPos() {
+  try {
+    localStorage.removeItem(BAR_POS_KEY);
+  } catch {}
+  if (IN_APP) invoke("set_bar_position", { x: null, y: null }).catch(() => {});
+  setBanner("Back to the top of the screen.", "info", 2000);
+}
+
+// Drag anything marked data-drag (empty space, the orb column, the mini widget) to move the window.
+document.addEventListener("mousedown", (e) => {
+  if (!IN_APP || e.button !== 0 || e.detail > 1) return;
+  if (e.target.closest("button, input, textarea, a, [data-day], [data-month], [data-tab]")) return;
+  if (!e.target.closest("[data-drag]")) return;
+  getCurrentWindow()
+    .startDragging()
+    .catch(() => {});
+});
 
 /* ---------- instant actions (shared by bar, mini widget, menu bar and keyboard) ---------- */
 
 function toggleFlow() {
   if (!state.user) return;
-  return state.flow ? stopFlow() : startFlow();
+  if (state.flow) {
+    // You stopped it on purpose: don't auto-start again for a bit.
+    state.autoSnoozeUntil = Date.now() + 30 * 60 * 1000;
+    state.activeSince = null;
+    return stopFlow();
+  }
+  return startFlow();
 }
 
 async function addWin() {
@@ -842,7 +1304,7 @@ const ICON_EXPAND = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" 
 
 function miniPartnerBlock() {
   const partner = state.profiles.find((p) => p.id !== state.user.id);
-  if (!partner) return `<div class="mini-them" data-tauri-drag-region><span class="hint">Waiting for Seva</span></div>`;
+  if (!partner) return `<div class="mini-them" data-drag><span class="hint">Waiting for Seva</span></div>`;
   const ps = presenceStatus(partner);
   const pres = ps.kind === "offline" ? null : state.presence[partner.id];
   const flowStart = pres?.flow_started_at;
@@ -851,7 +1313,7 @@ function miniPartnerBlock() {
     ? `<div class="p-sub flow" data-flow-since="${flowStart}">In flow</div>`
     : `<div class="p-sub">${ps.kind === "online" ? "Online" : ps.kind === "away" ? `Away · ${esc(agoShort(ps.lastMs))}` : "Offline"}</div>`;
   return `
-    <div class="mini-them" data-tauri-drag-region title="${esc(partner.name)}">
+    <div class="mini-them" data-drag title="${esc(partner.name)}">
       ${avatar(partner, { size: "sm", status })}
       <div class="mini-txt"><b>${esc(partner.name.split(" ")[0])}</b>${sub}</div>
     </div>`;
@@ -862,22 +1324,25 @@ function renderMini() {
   const running = !!state.flow;
   const st = streakFor(state.me);
   app.classList.add("is-mini");
-  app.setAttribute("data-tauri-drag-region", "");
+  app.setAttribute("data-drag", "");
   app.innerHTML = `
-    <div class="orb mini-orb" data-tauri-drag-region title="Drag to move"></div>
+    <div class="orb mini-orb" data-drag title="Drag to move"></div>
     <button class="play mini-play ${running ? "stop" : ""}" id="miniflow" title="${running ? "End flow" : "Start flow"} (Space)">${running ? ICON_STOP : ICON_PLAY}</button>
-    <div class="mini-me" data-tauri-drag-region>
+    <div class="mini-me" data-drag>
       <div class="mini-clock ${running ? "live" : ""}" id="myclock">${running ? clock(flowElapsed()) : "Start flow"}</div>
       <div class="hint">${hm(flowTodayFor(state.user.id, MY_TZ))} today${st.current ? ` · 🔥${st.current}` : ""}</div>
     </div>
     <div class="mini-sep"></div>
     ${miniPartnerBlock()}
     <button class="mini-btn" id="miniwin" title="Log a win">🏆</button>
+    ${inviteActive() ? `<button class="pill primary mini-join" id="minijoin">Join 🔗</button>` : `<button class="mini-btn" id="minilock" title="Lock in together">🔗</button>`}
     <button class="mini-btn" id="mininudge" title="Nudge Seva">👊</button>
     <button class="mini-btn icon" id="miniexpand" title="Open (⌥⇧Space)">${ICON_EXPAND}</button>`;
   app.querySelector("#miniflow").addEventListener("click", toggleFlow);
   app.querySelector("#miniwin").addEventListener("click", addWin);
   app.querySelector("#mininudge").addEventListener("click", () => sendPoke("nudge"));
+  app.querySelector("#minijoin")?.addEventListener("click", joinLockIn);
+  app.querySelector("#minilock")?.addEventListener("click", sendLockIn);
   app.querySelector("#miniexpand").addEventListener("click", () => IN_APP && invoke("expand_bar").catch(() => {}));
   tick();
 }
@@ -889,10 +1354,11 @@ function onLayout(layout) {
     return;
   }
   app.classList.remove("is-mini");
-  app.removeAttribute("data-tauri-drag-region");
+  app.removeAttribute("data-drag");
   if (!state.user) return;
   if (state.screen === "checkin") renderCheckin();
-  else if (state.screen === "shell") renderShell();
+  else if (state.screen === "wrap") renderWrap();
+  else if (state.screen === "shell") state.eodPending ? renderWrap() : renderShell();
 }
 
 /* ---------- menu bar ---------- */
@@ -914,6 +1380,8 @@ const POKES = {
   fire: { icon: "🔥", title: (n) => `${n} sent you fire.`, subtitle: "Keep going.", sent: "Fire sent 🔥" },
   clap: { icon: "👏", title: (n) => `${n} is clapping for you.`, subtitle: "Respect.", sent: "Clap sent 👏" },
   call: { icon: "📞", title: (n) => `${n} wants a quick call.`, subtitle: "Hop on when you're free.", sent: "Call request sent 📞" },
+  lockin: { icon: "🔗", title: (n) => `${n} is locking in. Join?`, subtitle: "⌥⇧Space, then Join. Flow together scores a bonus.", sent: "Invite sent 🔗" },
+  joined: { icon: "🔗", title: (n) => `${n} joined you.`, subtitle: "Locked in together.", sent: "Joined 🔗" },
 };
 const lastPoke = {};
 
@@ -934,6 +1402,10 @@ function sendPoke(kind) {
 
 function onPoke(p) {
   if (!p || p.to !== state.user?.id || !POKES[p.kind]) return;
+  if (p.kind === "lockin") {
+    state.invite = { from: p.from, fromName: p.fromName, at: Date.now() };
+    renderBody();
+  }
   const k = POKES[p.kind];
   const name = String(p.fromName || "Your partner").split(" ")[0];
   celebrate({ kind: "poke", icon: k.icon, title: k.title(name), subtitle: k.subtitle, chips: [], intensity: p.kind === "fire" ? 1 : 0, palette: "cool", duration: 3800 });
@@ -958,6 +1430,8 @@ document.addEventListener("keydown", (e) => {
     toggleFlow();
   } else if (e.key === "w" || e.key === "W") {
     addWin();
+  } else if (e.key === "l" || e.key === "L") {
+    sendLockIn();
   } else if (/^[1-4]$/.test(e.key) && state.layout !== "mini") {
     const tab = TABS[Number(e.key) - 1];
     app.querySelector(`[data-tab="${tab}"]`)?.click();
@@ -1246,7 +1720,7 @@ function renderAuth(mode = "in", msg = "") {
   stopLoops();
   state.screen = "auth";
   app.classList.remove("is-mini");
-  app.removeAttribute("data-tauri-drag-region");
+  app.removeAttribute("data-drag");
   document.documentElement.classList.remove("tall");
   setBarHeight(BAR_HEIGHT_PX);
   const err = msg.startsWith("!");
@@ -1291,7 +1765,7 @@ function renderCheckin() {
   state.screen = "checkin";
   if (state.layout === "mini") return renderMini();
   app.classList.remove("is-mini");
-  app.removeAttribute("data-tauri-drag-region");
+  app.removeAttribute("data-drag");
   document.documentElement.classList.remove("tall");
   setBarHeight(BAR_HEIGHT_PX);
   const first = (state.me?.name || "").split(" ")[0];
@@ -1308,7 +1782,7 @@ function renderCheckin() {
         <input id="focus" placeholder="30 DMs to architects working with developers…" autocomplete="off">
         <button class="pill primary" id="go">Lock it in</button>
       </div>
-      <div class="msg"></div>
+      <div class="msg">${partnerRecapLine()}</div>
     </div>`;
   wireBrand();
   const input = app.querySelector("#focus");
@@ -1372,6 +1846,7 @@ async function pollIdle() {
     const isAway = idle * 1000 > AWAY_AFTER_MS;
     // Tell the other person straight away when you go away or come back.
     if (wasAway !== isAway) track();
+    trackActivity(idle);
   }
   if (!state.flow) return;
   if (idle != null && idle >= IDLE_CUTOFF_MINUTES * 60) {
@@ -1416,7 +1891,10 @@ function startLoops() {
   // Presence heartbeat, and re-render so "away" and stale people update even without new events.
   state.timers.push(setInterval(() => {
     track();
-    if (state.tab === "now") renderBody();
+    maybeSuggestLockIn();
+    checkEvening();
+    if (state.invite && !inviteActive()) state.invite = null;
+    if (state.tab === "now" || state.layout === "mini") renderBody();
   }, 60000));
   state.timers.push(setInterval(async () => {
     await Promise.all([loadProfiles(), loadActivity()]);
@@ -1443,7 +1921,9 @@ async function doEnter(user) {
   state.user = user;
   app.innerHTML = `<div class="loading">Loading…</div>`;
   await heartbeat();
-  await Promise.all([loadProfiles(), loadActivity()]);
+  await Promise.all([loadProfiles(), loadActivity(), loadGoal()]);
+  initAutostart();
+  restoreBarPos();
   if (!state.me) {
     app.innerHTML = `${brandColumn()}<div class="tile glass prompt"><div class="prompt-head"><h1>Almost there <span>· your profile is missing</span></h1><button class="link" id="out">Sign out</button></div><div class="msg">Run supabase/schema.sql in Supabase, then sign out and back in.</div></div>`;
     app.querySelector("#out").addEventListener("click", signOut);
@@ -1534,6 +2014,11 @@ sb.auth.onAuthStateChange((event, session) => {
 
 if (IN_APP) {
   listen("layout", (e) => onLayout(e.payload)).catch(() => {});
+  listen("bar-moved", (e) => {
+    try {
+      localStorage.setItem(BAR_POS_KEY, JSON.stringify(e.payload));
+    } catch {}
+  }).catch(() => {});
   listen("mini-moved", (e) => {
     try {
       localStorage.setItem(MINI_POS_KEY, JSON.stringify(e.payload));
@@ -1545,6 +2030,7 @@ if (IN_APP) {
     else if (e.payload === "pin") togglePinned();
   }).catch(() => {});
   listen("bar-shown", () => {
+    if (state.eodPending && state.screen === "shell" && state.layout !== "mini") renderWrap();
     app.classList.remove("drop");
     void app.offsetWidth;
     app.classList.add("drop");
@@ -1554,4 +2040,4 @@ if (IN_APP) {
 }
 
 // Browser previews only: switch layouts by hand.
-if (!IN_APP) window.__layout = onLayout;
+if (!IN_APP) Object.assign(window, { __layout: onLayout, __state: state, __render: () => renderBody(), __wrap: () => renderWrap() });

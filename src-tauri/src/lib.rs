@@ -90,7 +90,7 @@ const BAR_MAX_WIDTH: f64 = 920.0;
 const BAR_HEIGHT: u32 = 156;
 const BAR_MAX_TALL: u32 = 560;
 const BELOW_MENU_BAR: f64 = 42.0;
-const MINI_W: f64 = 440.0;
+const MINI_W: f64 = 520.0;
 const MINI_H: f64 = 64.0;
 const EDGE: f64 = 12.0;
 
@@ -103,6 +103,11 @@ static EXPANDED: AtomicBool = AtomicBool::new(false);
 /// Where the mini widget sits (logical px), stored as f64 bits. NaN = not set yet.
 static MINI_X: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
 static MINI_Y: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+/// Where you dragged the full bar to (logical px). NaN = default spot under the menu bar.
+static BAR_X: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+static BAR_Y: AtomicU64 = AtomicU64::new(0x7ff8_0000_0000_0000);
+/// True while we're moving the window ourselves, so it isn't mistaken for a user drag.
+static PLACING: AtomicBool = AtomicBool::new(false);
 /// When the bar last closed by itself, so the same click on the menu bar icon doesn't reopen it.
 static LAST_AUTO_HIDE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -118,6 +123,21 @@ fn mini_pos() -> Option<(f64, f64)> {
     } else {
         Some((x, y))
     }
+}
+
+fn bar_pos() -> Option<(f64, f64)> {
+    let x = f64::from_bits(BAR_X.load(Ordering::Relaxed));
+    let y = f64::from_bits(BAR_Y.load(Ordering::Relaxed));
+    if x.is_nan() || y.is_nan() {
+        None
+    } else {
+        Some((x, y))
+    }
+}
+
+fn set_bar_pos(x: f64, y: f64) {
+    BAR_X.store(x.to_bits(), Ordering::Relaxed);
+    BAR_Y.store(y.to_bits(), Ordering::Relaxed);
 }
 
 fn set_mini_pos(x: f64, y: f64) {
@@ -144,16 +164,22 @@ fn place_bar(window: &WebviewWindow) {
     let width = BAR_MAX_WIDTH.min(sw - 2.0 * EDGE);
     let height = BAR_H.load(Ordering::Relaxed) as f64;
     let (mut x, mut y) = (sx + (sw - width) / 2.0, sy + BELOW_MENU_BAR);
-    if PINNED.load(Ordering::Relaxed) {
+    if let Some((bx, by)) = bar_pos() {
+        // You dragged it somewhere: keep it there.
+        x = bx;
+        y = by;
+    } else if PINNED.load(Ordering::Relaxed) {
         if let Some((mx, my)) = mini_pos() {
             x = mx + MINI_W / 2.0 - width / 2.0;
             y = my;
         }
     }
     x = x.clamp(sx + EDGE, sx + sw - width - EDGE);
-    y = y.clamp(sy + BELOW_MENU_BAR - 8.0, (sy + sh - height - EDGE).max(sy + BELOW_MENU_BAR - 8.0));
+    y = y.clamp(sy + 24.0, (sy + sh - height - EDGE).max(sy + 24.0));
+    PLACING.store(true, Ordering::Relaxed);
     let _ = window.set_size(LogicalSize::new(width, height));
     let _ = window.set_position(LogicalPosition::new(x, y));
+    PLACING.store(false, Ordering::Relaxed);
 }
 
 /// Mini widget: where you last dragged it, or top right under the menu bar.
@@ -163,8 +189,10 @@ fn place_mini(window: &WebviewWindow) {
     let x = x.clamp(sx, sx + sw - MINI_W);
     let y = y.clamp(sy + 24.0, sy + sh - MINI_H);
     set_mini_pos(x, y);
+    PLACING.store(true, Ordering::Relaxed);
     let _ = window.set_size(LogicalSize::new(MINI_W, MINI_H));
     let _ = window.set_position(LogicalPosition::new(x, y));
+    PLACING.store(false, Ordering::Relaxed);
 }
 
 /// On macOS the bar is an NSPanel (like Spotlight or Raycast): it floats over
@@ -344,14 +372,19 @@ fn on_click_away(app: &AppHandle) {
 }
 
 fn on_moved(app: &AppHandle) {
-    if !PINNED.load(Ordering::Relaxed) || EXPANDED.load(Ordering::Relaxed) {
+    if PLACING.load(Ordering::Relaxed) {
         return;
     }
     let Some(window) = app.get_webview_window("main") else { return };
     let (Ok(pos), Ok(scale)) = (window.outer_position(), window.scale_factor()) else { return };
     let p = pos.to_logical::<f64>(scale);
-    set_mini_pos(p.x, p.y);
-    let _ = app.emit_to("main", "mini-moved", (p.x, p.y));
+    if EXPANDED.load(Ordering::Relaxed) {
+        set_bar_pos(p.x, p.y);
+        let _ = app.emit_to("main", "bar-moved", (p.x, p.y));
+    } else if PINNED.load(Ordering::Relaxed) {
+        set_mini_pos(p.x, p.y);
+        let _ = app.emit_to("main", "mini-moved", (p.x, p.y));
+    }
 }
 
 /* ---------- commands ---------- */
@@ -376,6 +409,20 @@ fn set_pinned(app: AppHandle, pinned: bool, x: Option<f64>, y: Option<f64>) {
     }
     if !EXPANDED.load(Ordering::Relaxed) {
         collapse(&app);
+    }
+}
+
+/// Restore where you last dragged the full bar, or pass nothing to snap it back under the menu bar.
+#[tauri::command]
+fn set_bar_position(app: AppHandle, x: Option<f64>, y: Option<f64>) {
+    match (x, y) {
+        (Some(x), Some(y)) => set_bar_pos(x, y),
+        _ => set_bar_pos(f64::NAN, f64::NAN),
+    }
+    if EXPANDED.load(Ordering::Relaxed) {
+        if let Some(window) = app.get_webview_window("main") {
+            place_bar(&window);
+        }
     }
 }
 
@@ -407,6 +454,23 @@ fn set_tray_state(app: AppHandle, title: Option<String>, flowing: bool, pinned: 
         let _ = items.flow.set_text(if flowing { "End flow" } else { "Start flow" });
         let _ = items.pin.set_text(if pinned { "Hide mini widget" } else { "Show mini widget" });
     }
+}
+
+/// Open at login on/off. Returns the current setting.
+#[tauri::command]
+fn set_autostart(app: AppHandle, enabled: Option<bool>) -> bool {
+    use tauri_plugin_autostart::ManagerExt;
+    let al = app.autolaunch();
+    match enabled {
+        Some(true) => {
+            let _ = al.enable();
+        }
+        Some(false) => {
+            let _ = al.disable();
+        }
+        None => {}
+    }
+    al.is_enabled().unwrap_or(false)
 }
 
 /// Cover the whole screen the bar is on with the celebration overlay and play it.
@@ -451,6 +515,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .plugin(tauri_plugin_autostart::init(tauri_plugin_autostart::MacosLauncher::LaunchAgent, None))
         .invoke_handler(tauri::generate_handler![
             now_playing,
             idle_seconds,
@@ -460,7 +525,9 @@ pub fn run() {
             set_pinned,
             dismiss,
             expand_bar,
-            set_tray_state
+            set_tray_state,
+            set_autostart,
+            set_bar_position
         ])
         .setup(|app| {
             // Menu bar only: no Dock icon.

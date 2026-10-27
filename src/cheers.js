@@ -54,7 +54,7 @@ function leadChip(before, after, userId) {
 }
 
 /** You just ended a flow session. */
-export function myFlowCheer({ seconds, startMs, endMs, tz, before, after, userId, flowTodaySec, longestBeforeSec, idle = false }) {
+export function myFlowCheer({ seconds, startMs, endMs, tz, before, after, userId, flowTodaySec, longestBeforeSec, idle = false, togetherSec = 0, partnerName = "" }) {
   const endHour = hourOf(endMs, tz);
   const startHour = hourOf(startMs, tz);
   const len = duration(seconds);
@@ -92,8 +92,15 @@ export function myFlowCheer({ seconds, startMs, endMs, tz, before, after, userId
   const record = longestBeforeSec > 0 && seconds > longestBeforeSec && seconds >= 45 * 60;
   if (lead?.tookLead) intensity = 3;
 
-  const chips = [`+${pts(Math.floor(seconds / 60))}`, `Flow today ${duration(flowTodaySec)}`];
+  const together = togetherSec >= 10 * 60;
+  const bonus = together ? Math.floor((togetherSec / 60) * 0.5) : 0;
+  const chips = [`+${pts(Math.floor(seconds / 60) + bonus)}`, `Flow today ${duration(flowTodaySec)}`];
+  if (together) chips.splice(1, 0, `🔗 ${duration(togetherSec)} with ${first(partnerName)}`);
   if (lead) chips.push(lead.text);
+  if (together && !lead?.tookLead && !(endHour >= 0 && endHour < 5)) {
+    icon = "🔗";
+    subtitle = `${duration(togetherSec)} of it locked in with ${first(partnerName)}.`;
+  }
 
   return {
     kind: "flow",
